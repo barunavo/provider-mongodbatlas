@@ -74,6 +74,7 @@ import (
 	index "github.com/crossplane-contrib/provider-mongodbatlas/internal/controller/cluster/search/index"
 	instance "github.com/crossplane-contrib/provider-mongodbatlas/internal/controller/cluster/serverless/instance"
 	connection "github.com/crossplane-contrib/provider-mongodbatlas/internal/controller/cluster/stream/connection"
+	connectionfailover "github.com/crossplane-contrib/provider-mongodbatlas/internal/controller/cluster/stream/connectionfailover"
 	instancestream "github.com/crossplane-contrib/provider-mongodbatlas/internal/controller/cluster/stream/instance"
 	privatelinkendpoint "github.com/crossplane-contrib/provider-mongodbatlas/internal/controller/cluster/stream/privatelinkendpoint"
 	processor "github.com/crossplane-contrib/provider-mongodbatlas/internal/controller/cluster/stream/processor"
@@ -150,6 +151,7 @@ func Setup(mgr ctrl.Manager, o controller.Options) error {
 		index.Setup,
 		instance.Setup,
 		connection.Setup,
+		connectionfailover.Setup,
 		instancestream.Setup,
 		privatelinkendpoint.Setup,
 		processor.Setup,
@@ -232,6 +234,7 @@ func SetupGated(mgr ctrl.Manager, o controller.Options) error {
 		index.SetupGated,
 		instance.SetupGated,
 		connection.SetupGated,
+		connectionfailover.SetupGated,
 		instancestream.SetupGated,
 		privatelinkendpoint.SetupGated,
 		processor.SetupGated,
@@ -313,6 +316,7 @@ func SetupWebhookWithManager(mgr ctrl.Manager) error {
 		index.SetupWebhookWithManager,
 		instance.SetupWebhookWithManager,
 		connection.SetupWebhookWithManager,
+		connectionfailover.SetupWebhookWithManager,
 		instancestream.SetupWebhookWithManager,
 		privatelinkendpoint.SetupWebhookWithManager,
 		processor.SetupWebhookWithManager,

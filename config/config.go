@@ -78,6 +78,7 @@ var terraformFrameworkIncludedResources = []string{
 	"mongodbatlas_service_account_project_assignment",
 	"mongodbatlas_service_account_secret",
 	"mongodbatlas_stream_connection",
+	"mongodbatlas_stream_connection_failover",
 	"mongodbatlas_stream_instance",
 	"mongodbatlas_stream_privatelink_endpoint",
 	"mongodbatlas_stream_processor",

@@ -58,6 +58,10 @@ spec:
             properties:
               forProvider:
                 properties:
+                  isClusterAiAssistantEnabled:
+                    description: Flag that indicates whether to enable the AI Assistant
+                      for the project's clusters.
+                    type: boolean
                   isCollectDatabaseSpecificsStatisticsEnabled:
                     description: Flag that indicates whether to enable statistics
                       in cluster metrics collection for the project. By default, this
@@ -72,6 +76,15 @@ spec:
                       still view Performance Advisor recommendations, but you must
                       create those indexes from mongosh. By default, this flag is
                       set to true.
+                    type: boolean
+                  isDataExplorerGenAiFeaturesEnabled:
+                    description: Flag that indicates whether to enable generative
+                      AI features in the Data Explorer for the project.
+                    type: boolean
+                  isDataExplorerGenAiSampleDocumentPassingEnabled:
+                    description: Flag that indicates whether to enable passing sample
+                      documents to generative AI features in the Data Explorer for
+                      the project.
                     type: boolean
                   isExtendedStorageSizesEnabled:
                     description: Flag that indicates whether to enable extended storage
@@ -281,6 +294,10 @@ spec:
                   for example because of an external controller is managing them, like an
                   autoscaler.
                 properties:
+                  isClusterAiAssistantEnabled:
+                    description: Flag that indicates whether to enable the AI Assistant
+                      for the project's clusters.
+                    type: boolean
                   isCollectDatabaseSpecificsStatisticsEnabled:
                     description: Flag that indicates whether to enable statistics
                       in cluster metrics collection for the project. By default, this
@@ -295,6 +312,15 @@ spec:
                       still view Performance Advisor recommendations, but you must
                       create those indexes from mongosh. By default, this flag is
                       set to true.
+                    type: boolean
+                  isDataExplorerGenAiFeaturesEnabled:
+                    description: Flag that indicates whether to enable generative
+                      AI features in the Data Explorer for the project.
+                    type: boolean
+                  isDataExplorerGenAiSampleDocumentPassingEnabled:
+                    description: Flag that indicates whether to enable passing sample
+                      documents to generative AI features in the Data Explorer for
+                      the project.
                     type: boolean
                   isExtendedStorageSizesEnabled:
                     description: Flag that indicates whether to enable extended storage
@@ -607,6 +633,10 @@ spec:
                             type: array
                         type: object
                     type: object
+                  isClusterAiAssistantEnabled:
+                    description: Flag that indicates whether to enable the AI Assistant
+                      for the project's clusters.
+                    type: boolean
                   isCollectDatabaseSpecificsStatisticsEnabled:
                     description: Flag that indicates whether to enable statistics
                       in cluster metrics collection for the project. By default, this
@@ -621,6 +651,15 @@ spec:
                       still view Performance Advisor recommendations, but you must
                       create those indexes from mongosh. By default, this flag is
                       set to true.
+                    type: boolean
+                  isDataExplorerGenAiFeaturesEnabled:
+                    description: Flag that indicates whether to enable generative
+                      AI features in the Data Explorer for the project.
+                    type: boolean
+                  isDataExplorerGenAiSampleDocumentPassingEnabled:
+                    description: Flag that indicates whether to enable passing sample
+                      documents to generative AI features in the Data Explorer for
+                      the project.
                     type: boolean
                   isExtendedStorageSizesEnabled:
                     description: Flag that indicates whether to enable extended storage

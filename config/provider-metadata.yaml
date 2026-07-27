@@ -431,6 +431,8 @@ resources:
                 - REPLICASET Replica set
                 - SHARDED	Sharded cluster
                 - GEOSHARDED Global Cluster
+            compute_max_instance_size: below the effective size.
+            compute_min_instance_size: above the effective size.
             config_server_management_mode: '- (Optional) Config Server Management Mode for creating or updating a sharded cluster. Valid values are ATLAS_MANAGED (default) and FIXED_TO_DEDICATED. When configured as ATLAS_MANAGED, Atlas may automatically switch the cluster''s config server type for optimal performance and savings. When configured as FIXED_TO_DEDICATED, the cluster will always use a dedicated config server. To learn more, see the Sharded Cluster Config Servers documentation.'
             config_server_type: Describes a sharded cluster's config server type. Valid values are DEDICATED and EMBEDDED. To learn more, see the Sharded Cluster Config Servers documentation.
             connection_strings: '- Set of connection strings that your applications use to connect to this cluster. More information in Connection-strings. Use the parameters in this object to connect your applications to this cluster. To learn more about the formats of connection strings, see Connection String Options. NOTE: Atlas returns the contents of this object after the cluster is operational, not while it builds the cluster.'
@@ -464,7 +466,7 @@ resources:
             labels: '- (Optional) Set that contains key-value pairs between 1 to 255 characters in length for tagging and categorizing the cluster. See below. DEPRECATED Use tags instead.'
             labels.key: '- The key that you want to write.'
             labels.value: '- The value that you want to write.'
-            lifecycle.ignore_changes: must be used to prevent Terraform from reverting Atlas auto-scaling changes back to your original configuration
+            lifecycle.ignore_changes: to preserve Atlas-managed instance_size, disk_size_gb, or disk_iops values when changing the shard topology.
             minimum_enabled_tls_protocol: '- (Optional) Sets the minimum Transport Layer Security (TLS) version the cluster accepts for incoming connections. Valid values are:'
             mongo_db_major_version: '- (Optional) Version of the cluster to deploy. Atlas supports all the MongoDB versions that have not reached End of Live for M10+ clusters. If omitted, Atlas deploys the cluster with the default version. For more details, see documentation. Atlas always deploys the cluster with the latest stable release of the specified version.  If you set a value to this parameter and set version_release_system CONTINUOUS, the resource returns an error. Either clear this parameter or set version_release_system: LTS.'
             mongo_db_version: '- Version of MongoDB the cluster runs, in major-version.minor-version format.'
@@ -497,7 +499,7 @@ resources:
             region_configs.region_name: '- (Optional) Physical location of your MongoDB cluster. The region you choose can affect network latency for clients accessing your databases.  Requires the Atlas region name, see the reference list for AWS, GCP, Azure.'
             region_configs[#].electable_specs.node_count: to 1 or higher, it must have a priority of exactly one (1) less than another region in the replication_specs[#].region_configs[#] array. The highest-priority region must have a priority of 7. The lowest possible priority is 1.
             replica_set_scaling_strategy: '- (Optional) Replica set scaling mode for your cluster. Valid values are WORKLOAD_TYPE, SEQUENTIAL and NODE_TYPE. By default, Atlas scales under WORKLOAD_TYPE. This mode allows Atlas to scale your analytics nodes in parallel to your operational nodes. When configured as SEQUENTIAL, Atlas scales all nodes sequentially. This mode is intended for steady-state workloads and applications performing latency-sensitive secondary reads. When configured as NODE_TYPE, Atlas scales your electable nodes in parallel with your read-only and analytics nodes. This mode is intended for large, dynamic workloads requiring frequent and timely cluster tier scaling. This is the fastest scaling strategy, but it might impact latency of workloads when performing extensive secondary reads. Modify the Replica Set Scaling Mode'
-            replication_specs: '- List of settings that configure your cluster regions. This attribute has one object per shard representing node configurations in each shard. For replica sets there is only one object representing node configurations. The replication_specs configuration for all shards within the same zone must be the same, with the exception of instance_size and disk_iops that can scale independently. Note that independent disk_iops values are supported for AWS Gen2 STANDARD (gp3) clusters, AWS PROVISIONED (io2) clusters, AWS HIGH_PERFORMANCE (Gen 2 io2) clusters, and Azure regions that support Extended IOPS. See below.'
+            replication_specs: '- List of settings that configure your cluster regions. This attribute has one object per shard representing node configurations in each shard. For replica sets there is only one object representing node configurations. The replication_specs configuration for all shards within the same zone must be the same, with the exception of instance_size and disk_iops that can scale independently. Note that independent disk_iops values are supported for AWS Gen2 STANDARD (gp3) clusters, AWS PROVISIONED (io2) clusters, AWS HIGH_PERFORMANCE (Gen 2 io2) clusters, and Azure regions that support Extended IOPS. If this list contains more than one entry, review Multi-shard clusters and topology changes before adding, removing, or reordering entries. See below.'
             replication_specs.external_id: '- Unique 24-hexadecimal digit string that identifies the replication object for a shard in a Cluster. This value corresponds to Shard ID displayed in the UI.'
             replication_specs.region_configs: '- (Optional) Configuration for the hardware specifications for nodes set for a given region. Each region_configs object describes the region''s priority in elections and the number and type of MongoDB nodes that Atlas deploys to the region. Each region_configs object must have either an analytics_specs object, electable_specs object, or read_only_specs object. See region_configs.'
             replication_specs.region_configs.analytics_auto_scaling: '- (Optional) Configuration for the Collection of settings that configures analytics-auto-scaling information for the cluster. The values for the analytics_auto_scaling attribute must be the same for all region_configs of a cluster. See below.'
@@ -551,6 +553,7 @@ resources:
             use_aws_time_based_snapshot_copy_for_fast_initial_sync: '- (Optional) Flag that indicates whether time-based snapshot copies will be used instead of slower standard snapshot copies during fast Atlas cross-region initial syncs. This flag is only relevant for clusters containing AWS nodes.'
             use_effective_fields: |-
                 - (Optional) Controls how hardware specification fields are returned in the response. When set to true, the non-effective specs (electable_specs, read_only_specs, analytics_specs) fields return the hardware specifications that the client provided. When set to false (default), the non-effective specs fields show the current hardware specifications. Cluster auto-scaling is the primary cause for differences between initial and current hardware specifications. This opt-in feature enhances auto-scaling workflows by eliminating the need for lifecycle.ignore_changes blocks and preventing plan drift from Atlas-managed changes. This attribute applies to dedicated clusters, not to tenant or flex clusters. This attribute will be deprecated in provider version 2.x and removed in 3.x when the new behavior becomes default. See Auto-Scaling with Effective Fields for more details.
+                If your cluster has more than one replication_specs entry, see Multi-shard clusters and topology changes before enabling this attribute.
                 Important: Toggle this flag and remove any existing lifecycle.ignore_changes blocks for spec fields in the same apply, without combining other changes. Toggling will result in increased plan verbosity with (known after apply) markers, which can be safely ignored. If you previously removed read_only_specs or analytics_specs attributes from your configuration, you'll get a validation error for safety reasons to prevent accidental node loss. To resolve: add the blocks back (to keep nodes) or with node_count = 0 (to delete nodes), apply without toggling the flag, then toggle in a separate apply.
             use_effective_fields.ignore_changes: blocks is required, including commenting and uncommenting when making intentional changes
             version_release_system: '- (Optional) - Release cadence that Atlas uses for this cluster. This parameter defaults to LTS. If you set this field to CONTINUOUS, you must omit the mongo_db_major_version field. Atlas accepts:'
@@ -4825,8 +4828,11 @@ resources:
             created: '- The ISO-8601-formatted timestamp of when Atlas created the project.'
             id: '- The project id.'
             ip_addresses: '- IP addresses in a project categorized by services. See IP Addresses. WARNING: This attribute is deprecated, use the mongodbatlas_project_ip_addresses data source instead.'
+            is_cluster_ai_assistant_enabled: '- (Optional) Flag that indicates whether to enable the AI Assistant for the project''s clusters.'
             is_collect_database_specifics_statistics_enabled: '- (Optional) Flag that indicates whether to enable statistics in cluster metrics collection for the project. By default, this flag is set to true.'
             is_data_explorer_enabled: '- (Optional) Flag that indicates whether to enable Data Explorer for the project. If enabled, you can query your database with an easy to use interface.  When Data Explorer is disabled, you cannot terminate slow operations from the Real-Time Performance Panel or create indexes from the Performance Advisor. You can still view Performance Advisor recommendations, but you must create those indexes from mongosh. By default, this flag is set to true.'
+            is_data_explorer_gen_ai_features_enabled: '- (Optional) Flag that indicates whether to enable generative AI features in the Data Explorer for the project.'
+            is_data_explorer_gen_ai_sample_document_passing_enabled: '- (Optional) Flag that indicates whether to enable passing sample documents to generative AI features in the Data Explorer for the project.'
             is_extended_storage_sizes_enabled: '- (Optional) Flag that indicates whether to enable extended storage sizes for the specified project. Clusters with extended storage sizes must be on AWS or GCP, and cannot span multiple regions. When extending storage size, initial syncs and cross-project snapshot restores will be slow. This setting should only be used as a measure of temporary relief; consider sharding if more storage is required.'
             is_performance_advisor_enabled: '- (Optional) Flag that indicates whether to enable Performance Advisor and Profiler for the project. If enabled, you can analyze database logs to recommend performance improvements. By default, this flag is set to true.'
             is_realtime_performance_panel_enabled: '- (Optional) Flag that indicates whether to enable Real Time Performance Panel for the project. If enabled, you can see real time metrics from your MongoDB database. By default, this flag is set to true.'
@@ -6010,6 +6016,110 @@ resources:
             username: '- Username of the account to connect to the Kafka cluster.'
             workspace_name: '- (Optional) Label that identifies the stream processing workspace.'
         importStatements: []
+    mongodbatlas_stream_connection_failover:
+        subCategory: Streams
+        name: mongodbatlas_stream_connection_failover
+        title: ""
+        examples:
+            - name: example
+              manifest: |-
+                {
+                  "authentication": {
+                    "mechanism": "PLAIN",
+                    "password": "${var.failover_kafka_password}",
+                    "username": "${var.failover_kafka_username}"
+                  },
+                  "bootstrap_servers": "${var.failover_bootstrap_servers}",
+                  "connection_name": "${mongodbatlas_stream_connection.example.connection_name}",
+                  "project_id": "${var.project_id}",
+                  "region": "DUBLIN_IRL",
+                  "security": {
+                    "protocol": "SASL_SSL"
+                  },
+                  "type": "Kafka",
+                  "workspace_name": "${mongodbatlas_stream_workspace.example.workspace_name}"
+                }
+              references:
+                bootstrap_servers: var.failover_bootstrap_servers
+                connection_name: mongodbatlas_stream_connection.example.connection_name
+                project_id: var.project_id
+                workspace_name: mongodbatlas_stream_workspace.example.workspace_name
+              dependencies:
+                mongodbatlas_stream_connection.example: |-
+                    {
+                      "authentication": {
+                        "mechanism": "PLAIN",
+                        "password": "${var.kafka_password}",
+                        "username": "${var.kafka_username}"
+                      },
+                      "bootstrap_servers": "${var.bootstrap_servers}",
+                      "connection_name": "KafkaConnection",
+                      "project_id": "${var.project_id}",
+                      "security": {
+                        "protocol": "SASL_SSL"
+                      },
+                      "type": "Kafka",
+                      "workspace_name": "${mongodbatlas_stream_workspace.example.workspace_name}"
+                    }
+                mongodbatlas_stream_workspace.example: |-
+                    {
+                      "data_process_region": {
+                        "cloud_provider": "AWS",
+                        "region": "VIRGINIA_USA"
+                      },
+                      "failover_regions": [
+                        {
+                          "cloud_provider": "AWS",
+                          "region": "DUBLIN_IRL"
+                        }
+                      ],
+                      "project_id": "${var.project_id}",
+                      "stream_config": {
+                        "tier": "SP10"
+                      },
+                      "workspace_name": "workspace-with-failover"
+                    }
+        argumentDocs:
+            access: (Attributes) Information about networking access. (see below for nested schema)
+            authentication: (Attributes) User credentials required to connect to a Kafka Cluster. Includes the authentication type, as well as the parameters for that authentication mode. (see below for nested schema)
+            bootstrap_servers: (String) Comma separated list of server addresses.
+            broker_public_certificate: (String) A trusted, public x509 certificate for connecting to Kafka over SSL.
+            client_id: (String) OIDC client identifier for authentication to the Kafka cluster.
+            client_secret: (String, Sensitive) OIDC client secret for authentication to the Kafka cluster.
+            cluster_name: (String) Name of the cluster configured for this connection.
+            cluster_project_id: (String) Unique 24-hexadecimal digit string that identifies the project that contains the configured cluster. Required if the ID does not match the project containing the streams workspace. You must first enable the organization setting.
+            config: (Map of String) A map of Kafka key-value pairs for optional configuration. This is a flat object, and keys can have '.' characters.
+            connection_id: (String) Reserved. Will be used by PRIVATE_LINK connection type.
+            connection_name: (String) Label that identifies the stream connection name.
+            create: (String) A string that can be parsed as a duration consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours).
+            db_role_to_execute: (Attributes) The name of a Built in or Custom DB Role to connect to an Atlas Cluster. (see below for nested schema)
+            delete: (String) A string that can be parsed as a duration consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours). Setting a timeout for a Delete operation is only applicable if changes are saved into state before the destroy operation occurs.
+            delete_on_create_timeout: (Boolean) Indicates whether to delete the resource being created if a timeout is reached when waiting for completion. When set to true and timeout occurs, it triggers the deletion and returns immediately without waiting for deletion to complete. When set to false, the timeout will not trigger resource deletion. If you suspect a transient error when the value is true, wait before retrying to allow resource deletion to finish. Default is true.
+            failover_connection_id: (String) Unique identifier of the connection.
+            mechanism: (String) Style of authentication. Can be one of PLAIN, SCRAM-256, SCRAM-512, or OAUTHBEARER.
+            method: (String) SASL OAUTHBEARER authentication method. Can only be OIDC currently.
+            name: (String) Reserved. Will be used by PRIVATE_LINK connection type.
+            networking: (Attributes) Networking configuration for Streams connections. (see below for nested schema)
+            password: (String, Sensitive) Password of the account to connect to the Kafka cluster.
+            project_id: (String) Unique 24-hexadecimal digit string that identifies your project, also known as groupId in the official documentation.
+            protocol: (String) Describes the transport type. Can be either SASL_PLAINTEXT, SASL_SSL, or SSL.
+            region: (String) The connection's region.
+            role: (String) The name of the role to use. Can be a built in role or a custom role.
+            sasl_oauthbearer_extensions: (String) SASL OAUTHBEARER extensions parameter for additional OAuth2 configuration.
+            scope: (String) OIDC scope parameter defining the access permissions requested.
+            security: (Attributes) Properties for the secure transport connection to Kafka. For SSL, this can include the trusted certificate to use. (see below for nested schema)
+            ssl_certificate: (String) SSL certificate for client authentication to Kafka.
+            ssl_key: (String, Sensitive) SSL key for client authentication to Kafka.
+            ssl_key_password: (String, Sensitive) Password for the SSL key, if it is password protected.
+            state: (String) The state of the connection.
+            tgw_route_id: (String) Reserved. Will be used by TRANSIT_GATEWAY connection type.
+            timeouts: (Attributes) (see below for nested schema)
+            token_endpoint_url: (String) OIDC token endpoint URL for obtaining access tokens.
+            type: (String) Type of the connection.
+            update: (String) A string that can be parsed as a duration consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours).
+            username: (String) Username of the account to connect to the Kafka cluster.
+            workspace_name: (String) Label that identifies the stream workspace.
+        importStatements: []
     mongodbatlas_stream_instance:
         subCategory: Streams
         name: mongodbatlas_stream_instance
@@ -6578,6 +6688,7 @@ resources:
             db: (String) Name of the database to use for the DLQ.
             delete_on_create_timeout: (Boolean) Indicates whether to delete the resource being created if a timeout is reached when waiting for completion. When set to true and timeout occurs, it triggers the deletion and returns immediately without waiting for deletion to complete. When set to false, the timeout will not trigger resource deletion. If you suspect a transient error when the value is true, wait before retrying to allow resource deletion to finish. Default is true.
             dlq: (Attributes) Dead letter queue for the stream processor. Refer to the MongoDB Atlas Docs for more information. (see below for nested schema)
+            failover_enabled: (Boolean) Indicates whether this stream processor is eligible for failover. When true, an operator can trigger a failover event to migrate the stream processor to a secondary region configured in the workspace's failover_regions. Requires an Atlas-to-Atlas or Atlas-to-Kafka pipeline with failover_regions configured on the workspace.
             id: (String) Unique 24-hexadecimal character string that identifies the stream processor.
             instance_name: (String, Deprecated) Label that identifies the stream processing workspace.
             options: (Attributes) Optional configuration for the stream processor. (see below for nested schema)
@@ -6607,6 +6718,24 @@ resources:
                 }
               references:
                 project_id: var.project_id
+            - name: test
+              manifest: |-
+                {
+                  "data_process_region": {
+                    "cloud_provider": "AWS",
+                    "region": "VIRGINIA_USA"
+                  },
+                  "failover_regions": [
+                    {
+                      "cloud_provider": "AWS",
+                      "region": "OREGON_USA"
+                    }
+                  ],
+                  "project_id": "${var.project_id}",
+                  "workspace_name": "WorkspaceName"
+                }
+              references:
+                project_id: var.project_id
             - name: example
               manifest: |-
                 {
@@ -6622,11 +6751,15 @@ resources:
         argumentDocs:
             cloud_provider: '- (Required) Label that identifies the cloud service provider where MongoDB Cloud performs stream processing. The MongoDB Atlas API describes the valid values.'
             data_process_region: '- (Required) Cloud service provider and region where MongoDB Cloud performs stream processing. See data process region.'
+            failover_regions: |-
+                - (Optional) List of cloud provider regions to which the workspace can fail over if the primary region becomes unavailable. See failover regions.
+                Write-once: once set, failover_regions cannot be changed in-place — any modification forces the workspace to be destroyed and recreated.
+                Mutually exclusive with  failover_regions and data_process_region cannot both be changed in the same apply. Apply each change in a separate operation.
             hostnames: '- List that contains the hostnames assigned to the stream workspace.'
             max_tier_size: '- (Optional) Max tier size for the Stream Workspace. Configures Memory / VCPU allowances.'
             project_id: '- (Required) Unique 24-hexadecimal digit string that identifies your project, also known as groupId in the official documentation.'
             region: '- (Required) Name of the cloud provider region hosting Atlas Stream Processing. The MongoDB Atlas API describes the valid values.'
-            stream_config: '- (Optional) Configuration options for an Atlas Stream Processing Instance. See stream config'
+            stream_config: '- (Optional) Configuration options for an Atlas Stream Processing Instance. See stream config.'
             tier: '- (Optional) Selected tier for the Stream Workspace. Configures Memory / VCPU allowances. The MongoDB Atlas API describes the valid values.'
             workspace_name: '- (Required) Label that identifies the stream workspace.'
         importStatements: []

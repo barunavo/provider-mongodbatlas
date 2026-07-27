@@ -47,6 +47,46 @@ func (mg *Connection) SetWriteConnectionSecretToReference(r *xpv1.LocalSecretRef
 	mg.Spec.WriteConnectionSecretToReference = r
 }
 
+// GetCondition of this ConnectionFailover.
+func (mg *ConnectionFailover) GetCondition(ct xpv1.ConditionType) xpv1.Condition {
+	return mg.Status.GetCondition(ct)
+}
+
+// GetManagementPolicies of this ConnectionFailover.
+func (mg *ConnectionFailover) GetManagementPolicies() xpv1.ManagementPolicies {
+	return mg.Spec.ManagementPolicies
+}
+
+// GetProviderConfigReference of this ConnectionFailover.
+func (mg *ConnectionFailover) GetProviderConfigReference() *xpv1.ProviderConfigReference {
+	return mg.Spec.ProviderConfigReference
+}
+
+// GetWriteConnectionSecretToReference of this ConnectionFailover.
+func (mg *ConnectionFailover) GetWriteConnectionSecretToReference() *xpv1.LocalSecretReference {
+	return mg.Spec.WriteConnectionSecretToReference
+}
+
+// SetConditions of this ConnectionFailover.
+func (mg *ConnectionFailover) SetConditions(c ...xpv1.Condition) {
+	mg.Status.SetConditions(c...)
+}
+
+// SetManagementPolicies of this ConnectionFailover.
+func (mg *ConnectionFailover) SetManagementPolicies(r xpv1.ManagementPolicies) {
+	mg.Spec.ManagementPolicies = r
+}
+
+// SetProviderConfigReference of this ConnectionFailover.
+func (mg *ConnectionFailover) SetProviderConfigReference(r *xpv1.ProviderConfigReference) {
+	mg.Spec.ProviderConfigReference = r
+}
+
+// SetWriteConnectionSecretToReference of this ConnectionFailover.
+func (mg *ConnectionFailover) SetWriteConnectionSecretToReference(r *xpv1.LocalSecretReference) {
+	mg.Spec.WriteConnectionSecretToReference = r
+}
+
 // GetCondition of this Instance.
 func (mg *Instance) GetCondition(ct xpv1.ConditionType) xpv1.Condition {
 	return mg.Status.GetCondition(ct)

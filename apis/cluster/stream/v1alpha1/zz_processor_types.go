@@ -86,6 +86,10 @@ type ProcessorInitParameters struct {
 	// Indicates whether to delete the resource being created if a timeout is reached when waiting for completion. When set to `true` and timeout occurs, it triggers the deletion and returns immediately without waiting for deletion to complete. When set to `false`, the timeout will not trigger resource deletion. If you suspect a transient error when the value is `true`, wait before retrying to allow resource deletion to finish. Default is `true`.
 	DeleteOnCreateTimeout *bool `json:"deleteOnCreateTimeout,omitempty" tf:"delete_on_create_timeout,omitempty"`
 
+	// to-Atlas or Atlas-to-Kafka pipeline with failover_regions configured on the workspace.
+	// Indicates whether this stream processor is eligible for failover. When `true`, an operator can trigger a failover event to migrate the stream processor to a secondary region configured in the workspace's `failover_regions`. Requires an Atlas-to-Atlas or Atlas-to-Kafka pipeline with `failover_regions` configured on the workspace.
+	FailoverEnabled *bool `json:"failoverEnabled,omitempty" tf:"failover_enabled,omitempty"`
+
 	// (String, Deprecated) Label that identifies the stream processing workspace.
 	// Label that identifies the stream processing workspace.
 	// +crossplane:generate:reference:type=github.com/crossplane-contrib/provider-mongodbatlas/apis/cluster/stream/v1alpha1.Instance
@@ -148,6 +152,10 @@ type ProcessorObservation struct {
 	// Indicates whether to delete the resource being created if a timeout is reached when waiting for completion. When set to `true` and timeout occurs, it triggers the deletion and returns immediately without waiting for deletion to complete. When set to `false`, the timeout will not trigger resource deletion. If you suspect a transient error when the value is `true`, wait before retrying to allow resource deletion to finish. Default is `true`.
 	DeleteOnCreateTimeout *bool `json:"deleteOnCreateTimeout,omitempty" tf:"delete_on_create_timeout,omitempty"`
 
+	// to-Atlas or Atlas-to-Kafka pipeline with failover_regions configured on the workspace.
+	// Indicates whether this stream processor is eligible for failover. When `true`, an operator can trigger a failover event to migrate the stream processor to a secondary region configured in the workspace's `failover_regions`. Requires an Atlas-to-Atlas or Atlas-to-Kafka pipeline with `failover_regions` configured on the workspace.
+	FailoverEnabled *bool `json:"failoverEnabled,omitempty" tf:"failover_enabled,omitempty"`
+
 	// hexadecimal character string that identifies the stream processor.
 	ID *string `json:"id,omitempty" tf:"id,omitempty"`
 
@@ -198,6 +206,11 @@ type ProcessorParameters struct {
 	// Indicates whether to delete the resource being created if a timeout is reached when waiting for completion. When set to `true` and timeout occurs, it triggers the deletion and returns immediately without waiting for deletion to complete. When set to `false`, the timeout will not trigger resource deletion. If you suspect a transient error when the value is `true`, wait before retrying to allow resource deletion to finish. Default is `true`.
 	// +kubebuilder:validation:Optional
 	DeleteOnCreateTimeout *bool `json:"deleteOnCreateTimeout,omitempty" tf:"delete_on_create_timeout,omitempty"`
+
+	// to-Atlas or Atlas-to-Kafka pipeline with failover_regions configured on the workspace.
+	// Indicates whether this stream processor is eligible for failover. When `true`, an operator can trigger a failover event to migrate the stream processor to a secondary region configured in the workspace's `failover_regions`. Requires an Atlas-to-Atlas or Atlas-to-Kafka pipeline with `failover_regions` configured on the workspace.
+	// +kubebuilder:validation:Optional
+	FailoverEnabled *bool `json:"failoverEnabled,omitempty" tf:"failover_enabled,omitempty"`
 
 	// (String, Deprecated) Label that identifies the stream processing workspace.
 	// Label that identifies the stream processing workspace.
