@@ -1,8 +1,10 @@
 package refs
 
 const (
+	APIKeyID       = "api_key_id"
 	ClusterName    = "cluster_name"
 	ConnectionName = "connection_name"
+	ContainerID    = "container_id"
 	InstanceName   = "instance_name"
 	Name           = "name"
 	OrgID          = "org_id"

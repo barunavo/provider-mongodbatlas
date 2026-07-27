@@ -48,7 +48,7 @@ func TestImportJoinedID_DisableNameInitializer(t *testing.T) {
 	})
 
 	t.Run("provider-assigned key via importJoinedIDAssigned", func(t *testing.T) {
-		e := importJoinedIDAssigned([]string{refs.ProjectID, "container_id"}, "-", "container_id")
+		e := importJoinedIDAssigned([]string{refs.ProjectID, refs.ContainerID}, "-", refs.ContainerID)
 		assert.True(t, e.DisableNameInitializer)
 	})
 }
@@ -68,17 +68,17 @@ func TestImportJoinedID_GetIDFn(t *testing.T) {
 	})
 
 	t.Run("provider-assigned key included in base64 state ID", func(t *testing.T) {
-		e := importJoinedIDAssigned([]string{refs.ProjectID, "container_id"}, "-", "container_id")
+		e := importJoinedIDAssigned([]string{refs.ProjectID, refs.ContainerID}, "-", refs.ContainerID)
 		params := map[string]any{refs.ProjectID: testProjectID}
 		id, err := e.GetIDFn(context.Background(), "ctr-abc123", params, nil)
 		require.NoError(t, err)
 		decoded := decodeAtlasStateID(id)
 		assert.Equal(t, testProjectID, decoded[refs.ProjectID])
-		assert.Equal(t, "ctr-abc123", decoded["container_id"])
+		assert.Equal(t, "ctr-abc123", decoded[refs.ContainerID])
 	})
 
 	t.Run("provider-assigned key empty returns empty", func(t *testing.T) {
-		e := importJoinedIDAssigned([]string{refs.ProjectID, "container_id"}, "-", "container_id")
+		e := importJoinedIDAssigned([]string{refs.ProjectID, refs.ContainerID}, "-", refs.ContainerID)
 		params := map[string]any{refs.ProjectID: testProjectID}
 		id, err := e.GetIDFn(context.Background(), "", params, nil)
 		require.NoError(t, err)
@@ -99,7 +99,7 @@ func TestImportJoinedID_GetImportIDFn(t *testing.T) {
 	})
 
 	t.Run("provider-assigned key appended to plain import ID", func(t *testing.T) {
-		e := importJoinedIDAssigned([]string{refs.ProjectID, "container_id"}, "-", "container_id")
+		e := importJoinedIDAssigned([]string{refs.ProjectID, refs.ContainerID}, "-", refs.ContainerID)
 		params := map[string]any{refs.ProjectID: testProjectID}
 		id, err := e.GetImportIDFn(context.Background(), "ctr-abc123", params, nil)
 		require.NoError(t, err)
@@ -115,7 +115,7 @@ func TestImportJoinedID_GetImportIDFn(t *testing.T) {
 	})
 
 	t.Run("provider-assigned key empty returns empty", func(t *testing.T) {
-		e := importJoinedIDAssigned([]string{refs.ProjectID, "container_id"}, "-", "container_id")
+		e := importJoinedIDAssigned([]string{refs.ProjectID, refs.ContainerID}, "-", refs.ContainerID)
 		params := map[string]any{refs.ProjectID: testProjectID}
 		id, err := e.GetImportIDFn(context.Background(), "", params, nil)
 		require.NoError(t, err)
