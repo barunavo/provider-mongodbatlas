@@ -103,6 +103,41 @@ mkdir -p "$BACKUP_DIR"
 # only the leaf CR is not enough - the owning composite will keep re-applying
 # its (pre-migration) base template over it on every reconcile.
 # -----------------------------------------------------------------------------
+# Resolve the actual API resource name (plural) for a Kind by looking it up
+# in `kubectl api-resources`, rather than guessing lowercase(kind)+"s" - an
+# XRD can customize spec.names.singular/plural away from that convention.
+# Falls back to the lowercase guess if discovery doesn't find a match.
+resolve_resource_name() {
+  local kind="$1"
+  local resolved
+  resolved=$(kubectl api-resources --no-headers -o wide 2>/dev/null | awk -v k="$kind" '$0 ~ ("\\<" k "\\>") { for (i=1;i<=NF;i++) if ($i == k) { print $1; exit } }')
+  if [ -n "$resolved" ]; then
+    echo "$resolved"
+  else
+    echo "$kind" | tr '[:upper:]' '[:lower:]'
+  fi
+}
+
+# Setting the crossplane.io/paused annotation is not synchronous: a
+# reconcile that was already in flight (or queued) when the annotation was
+# set can still run to completion and re-apply the pre-migration base
+# template, clobbering a field we're about to backfill. Wait for the
+# composite's own Synced condition to actually report ReconcilePaused
+# before considering it safe - this is the same signal Crossplane itself
+# uses to confirm a resource has stopped reconciling.
+wait_for_pause_confirmed() {
+  local resource="$1" name="$2"
+  local i reason
+  for i in $(seq 1 30); do
+    reason=$(kubectl get "$resource" "$name" -o jsonpath='{.status.conditions[?(@.type=="Synced")].reason}' 2>/dev/null || true)
+    if [ "$reason" = "ReconcilePaused" ]; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
 pause_owner() {
   local cr_json="$1"
   local owner
@@ -114,20 +149,23 @@ pause_owner() {
   owner_kind=$(echo "$owner" | jq -r '.kind')
   owner_name=$(echo "$owner" | jq -r '.name')
   owner_api_version=$(echo "$owner" | jq -r '.apiVersion')
-  # crude but sufficient CRD-plural guess: lowercase kind + "s". Composite
-  # resource kinds are cluster-scoped and singular-to-plural is a simple
-  # suffix in every ACP/Crossplane XRD convention we've seen; if this ever
-  # doesn't resolve, `kubectl get "$owner_kind"` below will just fail loudly.
-  owner_resource=$(echo "$owner_kind" | tr '[:upper:]' '[:lower:]')
+  owner_resource=$(resolve_resource_name "$owner_kind")
 
-  log "    Owning composite: $owner_kind/$owner_name ($owner_api_version)"
+  log "    Owning composite: $owner_kind/$owner_name ($owner_api_version) -> resource: $owner_resource"
   if [ "$DRY_RUN" = "true" ]; then
     log "    [dry-run] would pause $owner_resource/$owner_name"
   else
     if kubectl annotate "$owner_resource" "$owner_name" crossplane.io/paused=true --overwrite >/dev/null 2>&1; then
-      log "    Paused $owner_resource/$owner_name"
+      log "    Pause annotation set on $owner_resource/$owner_name, waiting for it to take effect..."
+      if wait_for_pause_confirmed "$owner_resource" "$owner_name"; then
+        log "    Confirmed $owner_resource/$owner_name has stopped reconciling"
+      else
+        warn "    $owner_resource/$owner_name did not report ReconcilePaused within 60s - an in-flight reconcile may still land and overwrite backfilled fields. Verify manually before running 'post'."
+        echo "$owner_resource/$owner_name ($owner_kind) - pause not confirmed within timeout" >> "$BACKUP_DIR/unpaused-owners.txt"
+      fi
     else
-      warn "    Could not pause owning composite $owner_kind/$owner_name - pause it manually before continuing, or it may overwrite backfilled fields."
+      warn "    Could not pause owning composite $owner_kind/$owner_name (tried resource '$owner_resource') - pause it manually before continuing, or it may overwrite backfilled fields."
+      echo "$owner_resource/$owner_name ($owner_kind)" >> "$BACKUP_DIR/unpaused-owners.txt"
     fi
   fi
 }
@@ -147,6 +185,12 @@ pause_affected_and_owners() {
         kubectl annotate "$kind_crd" "$name" -n "$ns" crossplane.io/paused=true --overwrite >/dev/null
       else
         kubectl annotate "$kind_crd" "$name" crossplane.io/paused=true --overwrite >/dev/null
+      fi
+      if wait_for_pause_confirmed "$kind_crd" "$name"; then
+        log "    Confirmed $kind_crd/$name has stopped reconciling"
+      else
+        warn "    $kind_crd/$name did not report ReconcilePaused within 60s - an in-flight reconcile may still land. Verify manually before running 'post'."
+        echo "$kind_crd/$name - pause not confirmed within timeout" >> "$BACKUP_DIR/unpaused-owners.txt"
       fi
     fi
     pause_owner "$cr"
@@ -198,13 +242,44 @@ with open(live_path) as f:
 with open(v1_path) as f:
     v1 = yaml.safe_load(f)
 
-if len(live['spec']['versions']) != 1:
-    sys.exit(f"expected exactly one existing version on {live_path}, found {[v['name'] for v in live['spec']['versions']]}")
 if len(v1['spec']['versions']) != 1:
     sys.exit(f"expected exactly one version in {v1_path}, found {[v['name'] for v in v1['spec']['versions']]}")
 
-old_version = live['spec']['versions'][0]
 new_version = v1['spec']['versions'][0]
+live_version_names = [v['name'] for v in live['spec']['versions']]
+
+# Idempotency: if a previous `pre` run already applied the transitional CRD
+# (e.g. it succeeded here but died on the other CRD, or the whole phase is
+# simply being re-run), the live CRD already has both versions. Detect that
+# and re-emit the already-correct shape instead of failing, so `pre` is safe
+# to re-run after a partial failure.
+if len(live['spec']['versions']) == 2 and new_version['name'] in live_version_names:
+    for v in live['spec']['versions']:
+        if v['name'] == new_version['name']:
+            if not (v.get('served') and v.get('storage')):
+                sys.exit(
+                    f"{live_path} already has {new_version['name']} but it is not "
+                    f"served+storage (served={v.get('served')}, storage={v.get('storage')}) - "
+                    "refusing to guess; inspect and fix manually."
+                )
+        elif v.get('storage'):
+            sys.exit(
+                f"{live_path} already has 2 versions but the old version "
+                f"({v['name']}) is still marked storage=true - refusing to guess; "
+                "inspect and fix manually."
+            )
+    print(f"{live_path} is already transitional ({live_version_names}) - reusing it as-is -> {out_path}")
+    for k in ('resourceVersion', 'uid', 'creationTimestamp', 'generation', 'managedFields', 'selfLink'):
+        live['metadata'].pop(k, None)
+    live.pop('status', None)
+    with open(out_path, 'w') as f:
+        yaml.safe_dump(live, f, default_flow_style=False, sort_keys=False)
+    sys.exit(0)
+
+if len(live['spec']['versions']) != 1:
+    sys.exit(f"expected exactly one existing version on {live_path}, found {live_version_names}")
+
+old_version = live['spec']['versions'][0]
 
 old_version['served'] = True
 old_version['storage'] = False
@@ -255,6 +330,7 @@ if [ "$PHASE" = "pre" ]; then
   fi
 
   log "Pre-phase 2/3: pausing DatabaseUser/AdvancedCluster CRs and their owning composites..."
+  rm -f "$BACKUP_DIR/unpaused-owners.txt"
   pause_affected_and_owners "$USERS_CRD"
   pause_affected_and_owners "$ADVCLUSTERS_CRD"
 
@@ -271,6 +347,12 @@ if [ "$PHASE" = "pre" ]; then
   log ""
   log "Pre-phase complete. Backups saved to $BACKUP_DIR"
   log "The live CRDs now serve BOTH v1alpha2 and v1alpha3 (v1alpha3 is storage)."
+  if [ -s "$BACKUP_DIR/unpaused-owners.txt" ]; then
+    log ""
+    warn "$(wc -l < "$BACKUP_DIR/unpaused-owners.txt" | tr -d ' ') owning composite(s) could NOT be paused automatically:"
+    while read -r line; do warn "  - $line"; done < "$BACKUP_DIR/unpaused-owners.txt"
+    warn "Pause these manually before running '$0 post', or they may silently overwrite backfilled fields."
+  fi
   log ""
   log "IMPORTANT: do NOT install/activate the v1.x provider package yet - its"
   log "single-version CRDs would be REJECTED right now, because v1alpha2 is"
@@ -290,6 +372,18 @@ fi
 # required fields, re-store every CR at v1alpha3, then finish the CRD
 # transition so it matches what the v1.x provider package will install.
 # ---------------------------------------------------------------------------
+
+require_transitional_crd() {
+  local crd_name="$1"
+  local versions
+  versions=$(kubectl get crd "$crd_name" -o jsonpath='{.spec.versions[*].name}' 2>/dev/null) \
+    || die "cannot read CRD $crd_name - does it exist? Run '$0 pre --v1-crds-dir <dir>' first."
+  echo "$versions" | grep -qw 'v1alpha3' \
+    || die "$crd_name does not serve v1alpha3 yet - run '$0 pre --v1-crds-dir <dir>' first, it builds the transitional CRD that 'post' depends on."
+}
+
+require_transitional_crd "$USERS_CRD"
+require_transitional_crd "$ADVCLUSTERS_CRD"
 
 log "Post-phase Step 1: Patching DatabaseUser CRs..."
 
@@ -375,12 +469,16 @@ done
 log "Post-phase Step 3: Finishing CRD version transition..."
 
 for crd in "${AFFECTED_CRDS[@]}"; do
-  if ! kubectl get crd "$crd" >/dev/null 2>&1; then
-    log "  $crd: not installed, skipping"
-    continue
+  get_err=$(kubectl get crd "$crd" 2>&1 >/dev/null) && get_status=0 || get_status=$?
+  if [ "$get_status" -ne 0 ]; then
+    if echo "$get_err" | grep -qi 'NotFound'; then
+      log "  $crd: not installed, skipping"
+      continue
+    fi
+    die "cannot check CRD $crd: $get_err"
   fi
 
-  stored=$(kubectl get crd "$crd" -o jsonpath='{.status.storedVersions}' 2>/dev/null || echo "[]")
+  stored=$(kubectl get crd "$crd" -o jsonpath='{.status.storedVersions}') || die "cannot read storedVersions for $crd"
   if echo "$stored" | grep -q 'v1alpha2'; then
     log "  $crd: removing v1alpha2 from status.storedVersions"
     if [ "$DRY_RUN" = "true" ]; then
@@ -395,7 +493,7 @@ for crd in "${AFFECTED_CRDS[@]}"; do
     log "  $crd: v1alpha2 not in storedVersions, skipping"
   fi
 
-  versions=$(kubectl get crd "$crd" -o jsonpath='{.spec.versions[*].name}' 2>/dev/null || echo "")
+  versions=$(kubectl get crd "$crd" -o jsonpath='{.spec.versions[*].name}') || die "cannot read spec.versions for $crd"
   if echo "$versions" | grep -qw 'v1alpha2'; then
     log "  $crd: dropping v1alpha2 from spec.versions"
     if [ "$DRY_RUN" = "true" ]; then

@@ -81,8 +81,24 @@ optional.
 
 The script discovers each affected CR's controlling owner
 (`ownerReferences[]` where `controller: true`) and pauses it too. If it can't
-find or pause the owner (e.g. an unexpected RBAC restriction), it prints a
-warning — pause it manually before continuing in that case.
+find or pause the owner (e.g. an unexpected RBAC restriction, or the owner no
+longer exists), it prints a warning and records the resource in
+`/tmp/crossplane-migration-backup/unpaused-owners.txt`, which is echoed back
+in the `pre`-phase summary — pause it manually before continuing in that case.
+
+**The `crossplane.io/paused` annotation is not synchronous.** Setting it only
+requests that the resource's controller stop reconciling — a reconcile that
+was already in flight or queued at the moment the annotation was set can
+still run to completion afterward, using pre-pause state, and clobber a field
+you're about to backfill. Confirmed live: a `User` CR's `username` was
+correctly backfilled, then wiped ~3 minutes later by its owning XR's reconcile
+that had already started before the pause took effect — no error was logged
+for either operation. The script therefore does not consider a pause complete
+until the resource's own `status.conditions[type=Synced].reason` reports
+`ReconcilePaused` (the same signal Crossplane itself surfaces once a
+resource has actually stopped reconciling), polling for up to 60 seconds. If
+that confirmation doesn't arrive in time, it's treated the same as a failed
+pause (warned, and recorded in `unpaused-owners.txt`).
 
 ## Migration Steps
 
@@ -113,7 +129,7 @@ Example output:
 [migrate] Pre-phase 2/3: pausing DatabaseUser/AdvancedCluster CRs and their owning composites...
 [migrate]   Pausing users.database.mongodbatlas.crossplane.io/my-db-user (and its owning composite, if any)
 [migrate]     [dry-run] would pause users.database.mongodbatlas.crossplane.io/my-db-user
-[migrate]     Owning composite: XDBUser/my-db-user-abc12 (composite.example.org/v1alpha1)
+[migrate]     Owning composite: XDBUser/my-db-user-abc12 (composite.example.org/v1alpha1) -> resource: xdbuser
 [migrate]     [dry-run] would pause xdbuser/my-db-user-abc12
 [migrate] Pre-phase 3/3: building and applying transitional (dual-version) CRDs...
 [migrate]   [dry-run] would build and apply transitional CRDs for users.database.mongodbatlas.crossplane.io and advancedclusters.mongodbatlas.crossplane.io
