@@ -7,23 +7,50 @@
 #   2. Triggering re-storage of AdvancedCluster CRs
 #   3. Removing v1alpha2 from storedVersions on affected CRDs
 #
-# IMPORTANT: v0.x's CRD schema for `users.database.mongodbatlas.crossplane.io`
-# (v1alpha2) does not define `spec.forProvider.username`. Patching that field
-# while v0.x's CRD is still installed is silently dropped by structural-schema
-# pruning ("Warning: unknown field"). The field only exists once the v1.x CRD
-# (v1alpha3) is installed. This script therefore MUST run in "pre" phase before
-# the v1.x provider/CRDs are installed (to take backups only), and in "post"
-# phase after the v1.x provider/CRDs are installed but before the provider's
-# controller has reconciled the affected CRs, to backfill the now-required
-# fields before any Update is attempted against them.
+# BACKGROUND
+# ----------
+# `spec.forProvider.username` does not exist in the v0.x (v1alpha2) schema for
+# `users.database.mongodbatlas.crossplane.io` - it is only added in the v1.x
+# (v1alpha3) schema, which REPLACES v1alpha2 rather than adding alongside it.
+# This creates a real chicken-and-egg problem:
+#   - You cannot backfill `username` before v1.x's CRD is installed: the field
+#     doesn't exist yet, and structural-schema pruning silently drops the patch
+#     ("Warning: unknown field").
+#   - You cannot install v1.x's CRD (which only declares v1alpha3) while
+#     `status.storedVersions` on the live CRD still lists `v1alpha2`:
+#     Kubernetes refuses ("... v1alpha2 was previously a storage version, and
+#     must remain in spec.versions until a storage migration ensures no data
+#     remains persisted in v1alpha2 ...").
+#
+# The only way through is a TRANSITIONAL CRD, applied directly with `kubectl
+# apply` (bypassing Crossplane's package manager, which only ships the final
+# single-version v1.x CRD), that serves BOTH v1alpha2 and v1alpha3 side by
+# side. This lets existing objects be re-stored at v1alpha3 (and username
+# backfilled) before v1alpha2 is dropped, satisfying Kubernetes' migration
+# rule. This script builds that transitional CRD by merging the currently
+# installed CRD with the v1.x CRD YAML you provide via --v1-crds-dir.
+#
+# ALSO IMPORTANT: pausing the leaf DatabaseUser/AdvancedCluster CR
+# (`crossplane.io/paused`) only stops the *provider's* reconciler. It does
+# NOT stop a Composite Resource (XR) that owns/composes that CR from
+# continuing to render and re-apply its (v1alpha2-shaped, username-less)
+# `base` template over it - which will silently overwrite any username you
+# just backfilled. This script also finds and pauses the controlling owner
+# (ownerReferences[] where controller=true) of each affected CR, if any.
 #
 # Usage:
-#   ./scripts/migrate-to-v1.sh pre    # run BEFORE installing/activating v1.x
-#   ./scripts/migrate-to-v1.sh post   # run AFTER installing/activating v1.x,
-#                                      # before letting the v1.x provider run
+#   ./scripts/migrate-to-v1.sh pre --v1-crds-dir <dir>
+#   # install/activate the v1.x provider package here - see step-by-step
+#   # instructions printed at the end of `pre`
+#   ./scripts/migrate-to-v1.sh post
+#
+# <dir> should contain the v1.x package's CRD YAMLs, e.g. by extracting them
+# from the target provider image or checking out the provider-mongodbatlas
+# repo at the target tag: package/crds/mongodbatlas.crossplane.io_advancedclusters.yaml
+# and package/crds/database.mongodbatlas.crossplane.io_users.yaml.
 #
 # Dry run (no changes applied):
-#   DRY_RUN=true ./scripts/migrate-to-v1.sh pre
+#   DRY_RUN=true ./scripts/migrate-to-v1.sh pre --v1-crds-dir <dir>
 #   DRY_RUN=true ./scripts/migrate-to-v1.sh post
 #
 # DISCLAIMER: This script is provided "as is", without warranty of any kind,
@@ -36,10 +63,13 @@ set -euo pipefail
 BACKUP_DIR="/tmp/crossplane-migration-backup"
 DRY_RUN="${DRY_RUN:-false}"
 
+USERS_CRD="users.database.mongodbatlas.crossplane.io"
+ADVCLUSTERS_CRD="advancedclusters.mongodbatlas.crossplane.io"
+
 AFFECTED_CRDS=(
-  "advancedclusters.mongodbatlas.crossplane.io"
+  "$ADVCLUSTERS_CRD"
   "advancedclusters.mongodbatlas.m.crossplane.io"
-  "users.database.mongodbatlas.crossplane.io"
+  "$USERS_CRD"
   "users.database.mongodbatlas.m.crossplane.io"
 )
 
@@ -52,48 +82,171 @@ command -v kubectl >/dev/null || die "kubectl not found"
 command -v jq >/dev/null      || die "jq not found"
 
 PHASE="${1:-}"
+shift || true
+V1_CRDS_DIR=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --v1-crds-dir) V1_CRDS_DIR="$2"; shift 2 ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
+
 case "$PHASE" in
   pre|post) ;;
-  *) die "usage: $0 <pre|post>  (see script header for details)" ;;
+  *) die "usage: $0 <pre|post> [--v1-crds-dir <dir>]  (see script header for details)" ;;
 esac
 
 mkdir -p "$BACKUP_DIR"
 
+# -----------------------------------------------------------------------------
+# Pause the controlling owner (XR/composite) of a CR, if it has one. Pausing
+# only the leaf CR is not enough - the owning composite will keep re-applying
+# its (pre-migration) base template over it on every reconcile.
+# -----------------------------------------------------------------------------
+pause_owner() {
+  local cr_json="$1"
+  local owner
+  owner=$(echo "$cr_json" | jq -c '.metadata.ownerReferences[]? | select(.controller == true)' 2>/dev/null || true)
+  if [ -z "$owner" ]; then
+    return 0
+  fi
+  local owner_kind owner_name owner_api_version owner_resource
+  owner_kind=$(echo "$owner" | jq -r '.kind')
+  owner_name=$(echo "$owner" | jq -r '.name')
+  owner_api_version=$(echo "$owner" | jq -r '.apiVersion')
+  # crude but sufficient CRD-plural guess: lowercase kind + "s". Composite
+  # resource kinds are cluster-scoped and singular-to-plural is a simple
+  # suffix in every ACP/Crossplane XRD convention we've seen; if this ever
+  # doesn't resolve, `kubectl get "$owner_kind"` below will just fail loudly.
+  owner_resource=$(echo "$owner_kind" | tr '[:upper:]' '[:lower:]')
+
+  log "    Owning composite: $owner_kind/$owner_name ($owner_api_version)"
+  if [ "$DRY_RUN" = "true" ]; then
+    log "    [dry-run] would pause $owner_resource/$owner_name"
+  else
+    if kubectl annotate "$owner_resource" "$owner_name" crossplane.io/paused=true --overwrite >/dev/null 2>&1; then
+      log "    Paused $owner_resource/$owner_name"
+    else
+      warn "    Could not pause owning composite $owner_kind/$owner_name - pause it manually before continuing, or it may overwrite backfilled fields."
+    fi
+  fi
+}
+
+pause_affected_and_owners() {
+  local kind_crd="$1" # e.g. users.database.mongodbatlas.crossplane.io
+  local items
+  items=$(kubectl get "$kind_crd" -A -o json 2>/dev/null || echo '{"items":[]}')
+  echo "$items" | jq -c '.items[]' 2>/dev/null | while read -r cr; do
+    name=$(echo "$cr" | jq -r '.metadata.name')
+    ns=$(echo "$cr" | jq -r '.metadata.namespace // empty')
+    log "  Pausing $kind_crd/$name (and its owning composite, if any)"
+    if [ "$DRY_RUN" = "true" ]; then
+      log "    [dry-run] would pause $kind_crd/$name"
+    else
+      if [ -n "$ns" ]; then
+        kubectl annotate "$kind_crd" "$name" -n "$ns" crossplane.io/paused=true --overwrite >/dev/null
+      else
+        kubectl annotate "$kind_crd" "$name" crossplane.io/paused=true --overwrite >/dev/null
+      fi
+    fi
+    pause_owner "$cr"
+  done
+}
+
 backup_users() {
-  db_users=$(kubectl get users.database.mongodbatlas.crossplane.io -A -o json 2>/dev/null || echo '{"items":[]}')
+  db_users=$(kubectl get "$USERS_CRD" -A -o json 2>/dev/null || echo '{"items":[]}')
   echo "$db_users" | jq -c '.items[]' 2>/dev/null | while read -r cr; do
     name=$(echo "$cr" | jq -r '.metadata.name')
     ns=$(echo "$cr" | jq -r '.metadata.namespace // "cluster-scoped"')
     if [ "$ns" = "cluster-scoped" ]; then
-      kubectl get users.database.mongodbatlas.crossplane.io "$name" -o yaml > "$BACKUP_DIR/dbuser-$name.yaml"
+      kubectl get "$USERS_CRD" "$name" -o yaml > "$BACKUP_DIR/dbuser-$name.yaml"
     else
-      kubectl get users.database.mongodbatlas.crossplane.io "$name" -n "$ns" -o yaml > "$BACKUP_DIR/dbuser-$ns-$name.yaml"
+      kubectl get "$USERS_CRD" "$name" -n "$ns" -o yaml > "$BACKUP_DIR/dbuser-$ns-$name.yaml"
     fi
   done
 }
 
 backup_advancedclusters() {
-  adv_clusters=$(kubectl get advancedclusters.mongodbatlas.crossplane.io -A -o json 2>/dev/null || echo '{"items":[]}')
+  adv_clusters=$(kubectl get "$ADVCLUSTERS_CRD" -A -o json 2>/dev/null || echo '{"items":[]}')
   echo "$adv_clusters" | jq -c '.items[]' 2>/dev/null | while read -r cr; do
     name=$(echo "$cr" | jq -r '.metadata.name')
     ns=$(echo "$cr" | jq -r '.metadata.namespace // "cluster-scoped"')
     if [ "$ns" = "cluster-scoped" ]; then
-      kubectl get advancedclusters.mongodbatlas.crossplane.io "$name" -o yaml > "$BACKUP_DIR/advcluster-$name.yaml"
+      kubectl get "$ADVCLUSTERS_CRD" "$name" -o yaml > "$BACKUP_DIR/advcluster-$name.yaml"
     else
-      kubectl get advancedclusters.mongodbatlas.crossplane.io "$name" -n "$ns" -o yaml > "$BACKUP_DIR/advcluster-$ns-$name.yaml"
+      kubectl get "$ADVCLUSTERS_CRD" "$name" -n "$ns" -o yaml > "$BACKUP_DIR/advcluster-$ns-$name.yaml"
     fi
   done
 }
 
-if [ "$PHASE" = "pre" ]; then
-  # -------------------------------------------------------------------------
-  # Pre-phase: take backups only. Do NOT attempt to patch `username` yet -
-  # v0.x's CRD schema doesn't have the field, so the patch would silently
-  # no-op. Also do not touch storedVersions yet - v1alpha2 CRs still need
-  # to be readable/writable by the still-installed v0.x provider.
-  # -------------------------------------------------------------------------
-  log "Pre-phase: backing up DatabaseUser and AdvancedCluster CRs..."
+# -----------------------------------------------------------------------------
+# Build a transitional CRD (both v1alpha2 and v1alpha3 served, v1alpha3 as
+# storage) by merging the live CRD with the target v1.x CRD's v1alpha3
+# version block. Requires `python3` with PyYAML.
+# -----------------------------------------------------------------------------
+build_transitional_crd() {
+  local live_crd_name="$1" v1_crd_file="$2" out_file="$3"
+  command -v python3 >/dev/null || die "python3 (with PyYAML) is required to build the transitional CRD"
+  kubectl get crd "$live_crd_name" -o yaml > "$BACKUP_DIR/live-crd-$live_crd_name.yaml"
+  python3 - "$BACKUP_DIR/live-crd-$live_crd_name.yaml" "$v1_crd_file" "$out_file" <<'PYEOF'
+import sys, yaml
 
+live_path, v1_path, out_path = sys.argv[1:4]
+
+with open(live_path) as f:
+    live = yaml.safe_load(f)
+with open(v1_path) as f:
+    v1 = yaml.safe_load(f)
+
+if len(live['spec']['versions']) != 1:
+    sys.exit(f"expected exactly one existing version on {live_path}, found {[v['name'] for v in live['spec']['versions']]}")
+if len(v1['spec']['versions']) != 1:
+    sys.exit(f"expected exactly one version in {v1_path}, found {[v['name'] for v in v1['spec']['versions']]}")
+
+old_version = live['spec']['versions'][0]
+new_version = v1['spec']['versions'][0]
+
+old_version['served'] = True
+old_version['storage'] = False
+new_version['served'] = True
+new_version['storage'] = True
+
+live['spec']['versions'] = [old_version, new_version]
+
+for k in ('resourceVersion', 'uid', 'creationTimestamp', 'generation', 'managedFields', 'selfLink'):
+    live['metadata'].pop(k, None)
+live.pop('status', None)
+
+with open(out_path, 'w') as f:
+    yaml.safe_dump(live, f, default_flow_style=False, sort_keys=False)
+
+print(f"built transitional CRD: {[v['name'] for v in live['spec']['versions']]} -> {out_path}")
+PYEOF
+}
+
+drop_old_version_from_crd() {
+  local crd_name="$1" old_version_name="$2" out_file="$3"
+  kubectl get crd "$crd_name" -o yaml > "$out_file.orig"
+  python3 - "$out_file.orig" "$old_version_name" "$out_file" <<'PYEOF'
+import sys, yaml
+in_path, old_name, out_path = sys.argv[1:4]
+with open(in_path) as f:
+    crd = yaml.safe_load(f)
+crd['spec']['versions'] = [v for v in crd['spec']['versions'] if v['name'] != old_name]
+for k in ('resourceVersion', 'uid', 'creationTimestamp', 'generation', 'managedFields', 'selfLink'):
+    crd['metadata'].pop(k, None)
+crd.pop('status', None)
+with open(out_path, 'w') as f:
+    yaml.safe_dump(crd, f, default_flow_style=False, sort_keys=False)
+PYEOF
+}
+
+if [ "$PHASE" = "pre" ]; then
+  [ -n "$V1_CRDS_DIR" ] || die "pre phase requires --v1-crds-dir <dir> pointing at the v1.x provider's package/crds/ directory"
+  [ -f "$V1_CRDS_DIR/mongodbatlas.crossplane.io_advancedclusters.yaml" ] || die "missing $V1_CRDS_DIR/mongodbatlas.crossplane.io_advancedclusters.yaml"
+  [ -f "$V1_CRDS_DIR/database.mongodbatlas.crossplane.io_users.yaml" ] || die "missing $V1_CRDS_DIR/database.mongodbatlas.crossplane.io_users.yaml"
+
+  log "Pre-phase 1/3: backing up DatabaseUser and AdvancedCluster CRs..."
   if [ "$DRY_RUN" = "true" ]; then
     log "  [dry-run] would back up all DatabaseUser and AdvancedCluster CRs to $BACKUP_DIR"
   else
@@ -101,23 +254,46 @@ if [ "$PHASE" = "pre" ]; then
     backup_advancedclusters
   fi
 
+  log "Pre-phase 2/3: pausing DatabaseUser/AdvancedCluster CRs and their owning composites..."
+  pause_affected_and_owners "$USERS_CRD"
+  pause_affected_and_owners "$ADVCLUSTERS_CRD"
+
+  log "Pre-phase 3/3: building and applying transitional (dual-version) CRDs..."
+  if [ "$DRY_RUN" = "true" ]; then
+    log "  [dry-run] would build and apply transitional CRDs for $USERS_CRD and $ADVCLUSTERS_CRD"
+  else
+    build_transitional_crd "$USERS_CRD" "$V1_CRDS_DIR/database.mongodbatlas.crossplane.io_users.yaml" "$BACKUP_DIR/transitional-users.yaml"
+    build_transitional_crd "$ADVCLUSTERS_CRD" "$V1_CRDS_DIR/mongodbatlas.crossplane.io_advancedclusters.yaml" "$BACKUP_DIR/transitional-advancedclusters.yaml"
+    kubectl apply -f "$BACKUP_DIR/transitional-users.yaml"
+    kubectl apply -f "$BACKUP_DIR/transitional-advancedclusters.yaml"
+  fi
+
   log ""
   log "Pre-phase complete. Backups saved to $BACKUP_DIR"
-  log "Now install/activate the v1.x provider package (this installs the"
-  log "v1alpha3 CRDs), WITHOUT yet letting its controller reconcile, then run:"
-  log "  $0 post"
+  log "The live CRDs now serve BOTH v1alpha2 and v1alpha3 (v1alpha3 is storage)."
+  log ""
+  log "IMPORTANT: do NOT install/activate the v1.x provider package yet - its"
+  log "single-version CRDs would be REJECTED right now, because v1alpha2 is"
+  log "still in status.storedVersions. Instead:"
+  log "  1. Run: $0 post"
+  log "     (this backfills username/authDatabaseName and re-stores every"
+  log "     affected CR at v1alpha3, then removes v1alpha2 from storedVersions"
+  log "     and drops it from spec.versions, matching the v1.x CRD shape)"
+  log "  2. THEN install/activate the v1.x provider package."
+  log "  3. Once it is Healthy, unpause the CRs and their owning composites"
+  log "     that this script paused."
   exit 0
 fi
 
 # ---------------------------------------------------------------------------
-# Post-phase: v1.x CRDs (v1alpha3) are now installed and serve `username`.
-# Backfill required fields on existing CRs before the v1.x provider's
-# controller attempts to reconcile (and thus Update/validate) them.
+# Post-phase: the live CRDs now serve v1alpha3 (from the pre-phase). Backfill
+# required fields, re-store every CR at v1alpha3, then finish the CRD
+# transition so it matches what the v1.x provider package will install.
 # ---------------------------------------------------------------------------
 
 log "Post-phase Step 1: Patching DatabaseUser CRs..."
 
-db_users=$(kubectl get users.database.mongodbatlas.crossplane.io -A -o json 2>/dev/null || echo '{"items":[]}')
+db_users=$(kubectl get "$USERS_CRD" -A -o json 2>/dev/null || echo '{"items":[]}')
 user_count=$(echo "$db_users" | jq '.items | length')
 log "  Found $user_count DatabaseUser CR(s)"
 
@@ -155,11 +331,9 @@ echo "$db_users" | jq -c '.items[]' | while read -r cr; do
     log "    [dry-run] would patch: $patch"
   else
     if [ "$ns" = "cluster-scoped" ]; then
-      kubectl patch users.database.mongodbatlas.crossplane.io "$name" \
-        --type=merge -p "$patch"
+      kubectl patch "$USERS_CRD" "$name" --type=merge -p "$patch"
     else
-      kubectl patch users.database.mongodbatlas.crossplane.io "$name" \
-        -n "$ns" --type=merge -p "$patch"
+      kubectl patch "$USERS_CRD" "$name" -n "$ns" --type=merge -p "$patch"
     fi
   fi
 done
@@ -169,7 +343,7 @@ done
 # ---------------------------------------------------------------------------
 log "Post-phase Step 2: Triggering re-storage of AdvancedCluster CRs..."
 
-adv_clusters=$(kubectl get advancedclusters.mongodbatlas.crossplane.io -A -o json 2>/dev/null || echo '{"items":[]}')
+adv_clusters=$(kubectl get "$ADVCLUSTERS_CRD" -A -o json 2>/dev/null || echo '{"items":[]}')
 ac_count=$(echo "$adv_clusters" | jq '.items | length')
 log "  Found $ac_count AdvancedCluster CR(s)"
 
@@ -186,25 +360,29 @@ echo "$adv_clusters" | jq -c '.items[]' | while read -r cr; do
     ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     patch='{"metadata":{"annotations":{"migration.crossplane.io/v1alpha3-restorage":"'"$ts"'"}}}'
     if [ "$ns" = "cluster-scoped" ]; then
-      kubectl patch advancedclusters.mongodbatlas.crossplane.io "$name" \
-        --type=merge -p "$patch"
+      kubectl patch "$ADVCLUSTERS_CRD" "$name" --type=merge -p "$patch"
     else
-      kubectl patch advancedclusters.mongodbatlas.crossplane.io "$name" \
-        -n "$ns" --type=merge -p "$patch"
+      kubectl patch "$ADVCLUSTERS_CRD" "$name" -n "$ns" --type=merge -p "$patch"
     fi
   fi
 done
 
 # ---------------------------------------------------------------------------
-# Post-phase Step 3: Remove v1alpha2 from storedVersions on affected CRDs
+# Post-phase Step 3: Remove v1alpha2 from storedVersions on affected CRDs,
+# then drop v1alpha2 from spec.versions entirely so the CRD shape matches
+# what the v1.x provider package will install (which only declares v1alpha3).
 # ---------------------------------------------------------------------------
-log "Post-phase Step 3: Removing v1alpha2 from storedVersions..."
+log "Post-phase Step 3: Finishing CRD version transition..."
 
 for crd in "${AFFECTED_CRDS[@]}"; do
-  stored=$(kubectl get crd "$crd" -o jsonpath='{.status.storedVersions}' 2>/dev/null || echo "[]")
+  if ! kubectl get crd "$crd" >/dev/null 2>&1; then
+    log "  $crd: not installed, skipping"
+    continue
+  fi
 
+  stored=$(kubectl get crd "$crd" -o jsonpath='{.status.storedVersions}' 2>/dev/null || echo "[]")
   if echo "$stored" | grep -q 'v1alpha2'; then
-    log "  $crd: replacing storedVersions with [\"v1alpha3\"]"
+    log "  $crd: removing v1alpha2 from status.storedVersions"
     if [ "$DRY_RUN" = "true" ]; then
       log "    [dry-run] would set storedVersions=[\"v1alpha3\"]"
     else
@@ -216,8 +394,24 @@ for crd in "${AFFECTED_CRDS[@]}"; do
   else
     log "  $crd: v1alpha2 not in storedVersions, skipping"
   fi
+
+  versions=$(kubectl get crd "$crd" -o jsonpath='{.spec.versions[*].name}' 2>/dev/null || echo "")
+  if echo "$versions" | grep -qw 'v1alpha2'; then
+    log "  $crd: dropping v1alpha2 from spec.versions"
+    if [ "$DRY_RUN" = "true" ]; then
+      log "    [dry-run] would drop v1alpha2 from spec.versions"
+    else
+      drop_old_version_from_crd "$crd" "v1alpha2" "$BACKUP_DIR/final-$crd.yaml"
+      kubectl apply -f "$BACKUP_DIR/final-$crd.yaml"
+    fi
+  else
+    log "  $crd: v1alpha2 already absent from spec.versions, skipping"
+  fi
 done
 
 log ""
 log "Post-phase complete. Backups (from the pre-phase run) are in $BACKUP_DIR"
-log "The v1.x provider can now safely reconcile all migrated resources."
+log "The CRDs now match the shape the v1.x provider package will install."
+log "You can now install/activate the v1.x provider package."
+log "Once it is Healthy, unpause the CRs and their owning composites that"
+log "were paused in the pre-phase (annotate crossplane.io/paused- to remove)."
