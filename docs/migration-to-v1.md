@@ -102,14 +102,32 @@ pause (warned, and recorded in `unpaused-owners.txt`).
 
 ## Migration Steps
 
+Run in this exact order — each step depends on the previous one having
+actually completed, not just been started:
+
 ```bash
+# 1. Back up, pause affected CRs + their owning composites, and apply the
+#    transitional (dual-version) CRDs. Requires the v1.x CRD YAMLs on disk
+#    (see Prerequisites) - e.g. `git clone` this repo and `git checkout v1.0.0`,
+#    then pass --v1-crds-dir <checkout>/package/crds.
 ./scripts/migrate-to-v1.sh pre --v1-crds-dir /path/to/v1.x/package/crds
-# follow the printed next steps: run `post`, THEN install/activate the v1.x
-# provider package, THEN unpause
+
+# 2. Backfill required fields, re-store CRs at v1alpha3, then finish
+#    narrowing the CRDs down to the v1.x shape. `post` will refuse to run
+#    (with a clear error) if step 1 hasn't actually completed.
 ./scripts/migrate-to-v1.sh post
-# install / activate the v1.x provider package here
-# once it is Healthy, remove the crossplane.io/paused annotation from every
-# CR and composite the script paused
+
+# 3. Only now install/activate the v1.x provider package - the CRDs already
+#    match its expected single-version shape, so it establishes cleanly.
+#    (e.g. `kubectl patch provider.pkg.crossplane.io <name> --type=merge \
+#     -p '{"spec":{"package":"<registry>/provider-mongodbatlas:v1.0.0"}}'`,
+#    or however you manage Provider packages in your cluster.)
+
+# 4. Once the v1.x Provider reports Healthy, remove the crossplane.io/paused
+#    annotation from every CR and composite that step 1 paused (check
+#    /tmp/crossplane-migration-backup/unpaused-owners.txt for any it could
+#    NOT pause automatically - unpausing those isn't needed since they were
+#    never paused, but verify they didn't clobber anything in the meantime).
 ```
 
 ## Dry Run
