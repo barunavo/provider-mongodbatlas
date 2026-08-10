@@ -17,53 +17,70 @@ v1.0.0 upgrades these CRDs from `v1alpha2` to `v1alpha3`:
 
 - `kubectl` access to the cluster running `provider-mongodbatlas` v0.x.
 - `jq` installed.
-- Provider v1.x package ready but **not yet installed**.
+- Provider v1.x package ready to install.
+
+## Why this is a two-phase migration
+
+`spec.forProvider.username` does not exist in the `v0.x` (`v1alpha2`) schema for
+`users.database.mongodbatlas.crossplane.io` — it is only added in the `v1.x`
+(`v1alpha3`) schema. Patching `username` while the `v0.x` CRD is still active is
+silently dropped by Kubernetes' structural-schema pruning ("Warning: unknown
+field"), so the field **cannot** be backfilled before the `v1.x` CRDs are
+installed. It also cannot be left until after the `v1.x` provider's controller
+starts reconciling, because the CRD's CEL validation rejects any `Update`/`Create`
+against a `User` missing `username`.
+
+The migration therefore runs in two phases:
+
+1. **`pre`** (before installing/activating the `v1.x` provider): back up existing
+   `DatabaseUser` and `AdvancedCluster` CRs.
+2. Install/activate the `v1.x` provider package. This installs the `v1alpha3`
+   CRDs (which serve `username`) but you should do this before its controller
+   has a chance to reconcile the affected CRs — e.g. scale/pause the provider
+   deployment immediately after activation if your setup allows it.
+3. **`post`** (after the `v1.x` CRDs are installed): backfill `spec.forProvider.username`
+   and `spec.forProvider.authDatabaseName` on `DatabaseUser` CRs, trigger
+   re-storage of `AdvancedCluster` CRs, and remove `v1alpha2` from
+   `status.storedVersions` on the affected CRDs.
 
 ## Migration Steps
 
-Run the migration script **before** upgrading the provider:
-
 ```bash
-./scripts/migrate-to-v1.sh
+./scripts/migrate-to-v1.sh pre
+# install / activate the v1.x provider package here
+./scripts/migrate-to-v1.sh post
 ```
-
-The script will:
-1. Patch all `DatabaseUser` CRs to add `spec.forProvider.username` from `crossplane.io/external-name`.
-2. Patch all `DatabaseUser` CRs to set `spec.forProvider.authDatabaseName` from `crossplane.io/external-name` (if missing).
-3. Touch every `AdvancedCluster` CR to trigger re-storage at the current version.
-4. Patch `status.storedVersions` on both CRDs to remove `v1alpha2`.
-
-After running the script, upgrade the provider to v1.x.
 
 ## Dry Run
 
 Preview changes without modifying anything:
 
 ```bash
-DRY_RUN=true ./scripts/migrate-to-v1.sh
+DRY_RUN=true ./scripts/migrate-to-v1.sh pre
+DRY_RUN=true ./scripts/migrate-to-v1.sh post
 ```
 
 Example output:
 
 ```
-[migrate] Step 1: Patching DatabaseUser CRs...
+[migrate] Post-phase Step 1: Patching DatabaseUser CRs...
 [migrate]   Found 2 DatabaseUser CR(s)
 [migrate]   Processing default/my-db-user (external-name: admin)
-[migrate]     [dry-run] would patch username=admin
+[migrate]     [dry-run] would patch: {"spec":{"forProvider":{"username":"admin","authDatabaseName":"admin"}}}
 [migrate]   Processing default/my-other-user (external-name: readonly)
-[migrate]     [dry-run] would patch username=readonly
-[migrate] Step 2: Triggering re-storage of AdvancedCluster CRs...
+[migrate]     [dry-run] would patch: {"spec":{"forProvider":{"username":"readonly","authDatabaseName":"admin"}}}
+[migrate] Post-phase Step 2: Triggering re-storage of AdvancedCluster CRs...
 [migrate]   Found 1 AdvancedCluster CR(s)
 [migrate]   Touching default/my-cluster
 [migrate]     [dry-run] would touch my-cluster
-[migrate] Step 3: Removing v1alpha2 from storedVersions...
+[migrate] Post-phase Step 3: Removing v1alpha2 from storedVersions...
 [migrate]   advancedclusters.mongodbatlas.crossplane.io: removing v1alpha2 from storedVersions
 [migrate]     [dry-run] would set storedVersions=["v1alpha3"]
 [migrate]   users.database.mongodbatlas.crossplane.io: removing v1alpha2 from storedVersions
 [migrate]     [dry-run] would set storedVersions=["v1alpha3"]
 [migrate]
-[migrate] Migration complete. Backups saved to /tmp/crossplane-migration-backup
-[migrate] You can now upgrade provider-mongodbatlas to v1.x.
+[migrate] Post-phase complete. Backups (from the pre-phase run) are in /tmp/crossplane-migration-backup
+[migrate] The v1.x provider can now safely reconcile all migrated resources.
 ```
 
 ## Rollback

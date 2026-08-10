@@ -7,10 +7,24 @@
 #   2. Triggering re-storage of AdvancedCluster CRs
 #   3. Removing v1alpha2 from storedVersions on affected CRDs
 #
-# Run BEFORE upgrading the provider. Requires kubectl + jq.
+# IMPORTANT: v0.x's CRD schema for `users.database.mongodbatlas.crossplane.io`
+# (v1alpha2) does not define `spec.forProvider.username`. Patching that field
+# while v0.x's CRD is still installed is silently dropped by structural-schema
+# pruning ("Warning: unknown field"). The field only exists once the v1.x CRD
+# (v1alpha3) is installed. This script therefore MUST run in "pre" phase before
+# the v1.x provider/CRDs are installed (to take backups only), and in "post"
+# phase after the v1.x provider/CRDs are installed but before the provider's
+# controller has reconciled the affected CRs, to backfill the now-required
+# fields before any Update is attempted against them.
+#
+# Usage:
+#   ./scripts/migrate-to-v1.sh pre    # run BEFORE installing/activating v1.x
+#   ./scripts/migrate-to-v1.sh post   # run AFTER installing/activating v1.x,
+#                                      # before letting the v1.x provider run
 #
 # Dry run (no changes applied):
-#   DRY_RUN=true ./scripts/migrate-to-v1.sh
+#   DRY_RUN=true ./scripts/migrate-to-v1.sh pre
+#   DRY_RUN=true ./scripts/migrate-to-v1.sh post
 #
 # DISCLAIMER: This script is provided "as is", without warranty of any kind,
 # express or implied. Use at your own risk. Always test in a non-production
@@ -37,12 +51,71 @@ die()  { echo -e "${GREEN}[migrate]${NC} ${RED}ERROR:${NC} $*" >&2; exit 1; }
 command -v kubectl >/dev/null || die "kubectl not found"
 command -v jq >/dev/null      || die "jq not found"
 
+PHASE="${1:-}"
+case "$PHASE" in
+  pre|post) ;;
+  *) die "usage: $0 <pre|post>  (see script header for details)" ;;
+esac
+
 mkdir -p "$BACKUP_DIR"
 
+backup_users() {
+  db_users=$(kubectl get users.database.mongodbatlas.crossplane.io -A -o json 2>/dev/null || echo '{"items":[]}')
+  echo "$db_users" | jq -c '.items[]' 2>/dev/null | while read -r cr; do
+    name=$(echo "$cr" | jq -r '.metadata.name')
+    ns=$(echo "$cr" | jq -r '.metadata.namespace // "cluster-scoped"')
+    if [ "$ns" = "cluster-scoped" ]; then
+      kubectl get users.database.mongodbatlas.crossplane.io "$name" -o yaml > "$BACKUP_DIR/dbuser-$name.yaml"
+    else
+      kubectl get users.database.mongodbatlas.crossplane.io "$name" -n "$ns" -o yaml > "$BACKUP_DIR/dbuser-$ns-$name.yaml"
+    fi
+  done
+}
+
+backup_advancedclusters() {
+  adv_clusters=$(kubectl get advancedclusters.mongodbatlas.crossplane.io -A -o json 2>/dev/null || echo '{"items":[]}')
+  echo "$adv_clusters" | jq -c '.items[]' 2>/dev/null | while read -r cr; do
+    name=$(echo "$cr" | jq -r '.metadata.name')
+    ns=$(echo "$cr" | jq -r '.metadata.namespace // "cluster-scoped"')
+    if [ "$ns" = "cluster-scoped" ]; then
+      kubectl get advancedclusters.mongodbatlas.crossplane.io "$name" -o yaml > "$BACKUP_DIR/advcluster-$name.yaml"
+    else
+      kubectl get advancedclusters.mongodbatlas.crossplane.io "$name" -n "$ns" -o yaml > "$BACKUP_DIR/advcluster-$ns-$name.yaml"
+    fi
+  done
+}
+
+if [ "$PHASE" = "pre" ]; then
+  # -------------------------------------------------------------------------
+  # Pre-phase: take backups only. Do NOT attempt to patch `username` yet -
+  # v0.x's CRD schema doesn't have the field, so the patch would silently
+  # no-op. Also do not touch storedVersions yet - v1alpha2 CRs still need
+  # to be readable/writable by the still-installed v0.x provider.
+  # -------------------------------------------------------------------------
+  log "Pre-phase: backing up DatabaseUser and AdvancedCluster CRs..."
+
+  if [ "$DRY_RUN" = "true" ]; then
+    log "  [dry-run] would back up all DatabaseUser and AdvancedCluster CRs to $BACKUP_DIR"
+  else
+    backup_users
+    backup_advancedclusters
+  fi
+
+  log ""
+  log "Pre-phase complete. Backups saved to $BACKUP_DIR"
+  log "Now install/activate the v1.x provider package (this installs the"
+  log "v1alpha3 CRDs), WITHOUT yet letting its controller reconcile, then run:"
+  log "  $0 post"
+  exit 0
+fi
+
 # ---------------------------------------------------------------------------
-# Step 1: Patch DatabaseUser CRs, backfill username from external-name
+# Post-phase: v1.x CRDs (v1alpha3) are now installed and serve `username`.
+# Backfill required fields on existing CRs before the v1.x provider's
+# controller attempts to reconcile (and thus Update/validate) them.
 # ---------------------------------------------------------------------------
-log "Step 1: Patching DatabaseUser CRs..."
+
+log "Post-phase Step 1: Patching DatabaseUser CRs..."
 
 db_users=$(kubectl get users.database.mongodbatlas.crossplane.io -A -o json 2>/dev/null || echo '{"items":[]}')
 user_count=$(echo "$db_users" | jq '.items | length')
@@ -57,16 +130,6 @@ echo "$db_users" | jq -c '.items[]' | while read -r cr; do
 
   log "  Processing DatabaseUser $ns/$name (external-name: $ext_name)"
 
-  # Backup
-  if [ "$ns" = "cluster-scoped" ]; then
-    kubectl get users.database.mongodbatlas.crossplane.io "$name" -o yaml > "$BACKUP_DIR/dbuser-$name.yaml"
-  else
-    kubectl get users.database.mongodbatlas.crossplane.io "$name" -n "$ns" -o yaml > "$BACKUP_DIR/dbuser-$ns-$name.yaml"
-  fi
-
-  # In v0.x the external-name format was: the raw username (via NameAsIdentifier)
-  # In v1.0.0 the external-name format is: project_id/username/auth_database_name
-  # We need to populate spec.forProvider.username if missing
   if [ -n "$existing_username" ]; then
     log "    username already set ($existing_username), skipping"
     continue
@@ -77,14 +140,20 @@ echo "$db_users" | jq -c '.items[]' | while read -r cr; do
     continue
   fi
 
-  # The v0.x external-name was the raw username (NameAsIdentifier)
+  # In v0.x the external-name format was: the raw username (via NameAsIdentifier)
   username="$ext_name"
   log "    Setting spec.forProvider.username = $username"
 
+  patch_fields="\"username\":\"$username\""
+  if [ -z "$existing_auth_db" ]; then
+    log "    Setting spec.forProvider.authDatabaseName = admin (default)"
+    patch_fields="$patch_fields,\"authDatabaseName\":\"admin\""
+  fi
+  patch="{\"spec\":{\"forProvider\":{$patch_fields}}}"
+
   if [ "$DRY_RUN" = "true" ]; then
-    log "    [dry-run] would patch username=$username"
+    log "    [dry-run] would patch: $patch"
   else
-    patch='{"spec":{"forProvider":{"username":"'"$username"'"}}}'
     if [ "$ns" = "cluster-scoped" ]; then
       kubectl patch users.database.mongodbatlas.crossplane.io "$name" \
         --type=merge -p "$patch"
@@ -96,9 +165,9 @@ echo "$db_users" | jq -c '.items[]' | while read -r cr; do
 done
 
 # ---------------------------------------------------------------------------
-# Step 2: Touch AdvancedCluster CRs to trigger re-storage
+# Post-phase Step 2: Touch AdvancedCluster CRs to trigger re-storage
 # ---------------------------------------------------------------------------
-log "Step 2: Triggering re-storage of AdvancedCluster CRs..."
+log "Post-phase Step 2: Triggering re-storage of AdvancedCluster CRs..."
 
 adv_clusters=$(kubectl get advancedclusters.mongodbatlas.crossplane.io -A -o json 2>/dev/null || echo '{"items":[]}')
 ac_count=$(echo "$adv_clusters" | jq '.items | length')
@@ -109,13 +178,6 @@ echo "$adv_clusters" | jq -c '.items[]' | while read -r cr; do
   ns=$(echo "$cr" | jq -r '.metadata.namespace // "cluster-scoped"')
 
   log "  Touching AdvancedCluster $ns/$name"
-
-  # Backup
-  if [ "$ns" = "cluster-scoped" ]; then
-    kubectl get advancedclusters.mongodbatlas.crossplane.io "$name" -o yaml > "$BACKUP_DIR/advcluster-$name.yaml"
-  else
-    kubectl get advancedclusters.mongodbatlas.crossplane.io "$name" -n "$ns" -o yaml > "$BACKUP_DIR/advcluster-$ns-$name.yaml"
-  fi
 
   if [ "$DRY_RUN" = "true" ]; then
     log "    [dry-run] would touch $name"
@@ -134,9 +196,9 @@ echo "$adv_clusters" | jq -c '.items[]' | while read -r cr; do
 done
 
 # ---------------------------------------------------------------------------
-# Step 3: Remove v1alpha2 from storedVersions on affected CRDs
+# Post-phase Step 3: Remove v1alpha2 from storedVersions on affected CRDs
 # ---------------------------------------------------------------------------
-log "Step 3: Removing v1alpha2 from storedVersions..."
+log "Post-phase Step 3: Removing v1alpha2 from storedVersions..."
 
 for crd in "${AFFECTED_CRDS[@]}"; do
   stored=$(kubectl get crd "$crd" -o jsonpath='{.status.storedVersions}' 2>/dev/null || echo "[]")
@@ -157,5 +219,5 @@ for crd in "${AFFECTED_CRDS[@]}"; do
 done
 
 log ""
-log "Migration complete. Backups saved to $BACKUP_DIR"
-log "You can now upgrade provider-mongodbatlas to v1.x."
+log "Post-phase complete. Backups (from the pre-phase run) are in $BACKUP_DIR"
+log "The v1.x provider can now safely reconcile all migrated resources."
