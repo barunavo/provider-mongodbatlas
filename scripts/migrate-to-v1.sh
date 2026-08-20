@@ -197,6 +197,37 @@ pause_affected_and_owners() {
   done
 }
 
+# Checks whether the pre-phase actually recorded this CR - or its owning
+# composite - as NOT confirmed paused. post consults this to skip touching
+# genuinely-live resources rather than racing them and relying on the
+# post-patch verification alone: for a claim that's actively reconciling
+# (GitOps-managed, a real owner still busy), the right move is to leave it
+# alone and surface it for manual handling, not to attempt the patch and
+# hope the race doesn't land.
+is_unpaused() {
+  local cr_json="$1" kind_crd="$2"
+  [ -s "$BACKUP_DIR/unpaused-owners.txt" ] || return 1
+
+  local name
+  name=$(echo "$cr_json" | jq -r '.metadata.name')
+  if grep -qF "$kind_crd/$name " "$BACKUP_DIR/unpaused-owners.txt" 2>/dev/null; then
+    return 0
+  fi
+
+  local owner owner_kind owner_name owner_resource
+  owner=$(echo "$cr_json" | jq -c '.metadata.ownerReferences[]? | select(.controller == true)' 2>/dev/null || true)
+  if [ -n "$owner" ]; then
+    owner_kind=$(echo "$owner" | jq -r '.kind')
+    owner_name=$(echo "$owner" | jq -r '.name')
+    owner_resource=$(resolve_resource_name "$owner_kind")
+    if grep -qF "$owner_resource/$owner_name " "$BACKUP_DIR/unpaused-owners.txt" 2>/dev/null; then
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
 backup_users() {
   db_users=$(kubectl get "$USERS_CRD" -A -o json 2>/dev/null || echo '{"items":[]}')
   echo "$db_users" | jq -c '.items[]' 2>/dev/null | while read -r cr; do
@@ -406,6 +437,12 @@ echo "$db_users" | jq -c '.items[]' | while read -r cr; do
     continue
   fi
 
+  if is_unpaused "$cr" "$USERS_CRD"; then
+    warn "    $ns/$name (or its owning composite) was not confirmed paused in the pre-phase - skipping rather than racing a live reconcile. Pause it manually and re-run 'post' for this CR."
+    echo "$USERS_CRD/$name ($ns) - skipped, pause not confirmed in pre-phase" >> "$BACKUP_DIR/backfill-verification-failed.txt"
+    continue
+  fi
+
   if [ -z "$ext_name" ]; then
     warn "    No external-name annotation on $name, cannot infer username, skipping"
     continue
@@ -554,6 +591,12 @@ echo "$adv_clusters" | jq -c '.items[]' | while read -r cr; do
   ns=$(echo "$cr" | jq -r '.metadata.namespace // "cluster-scoped"')
   ext_name=$(echo "$cr" | jq -r '.metadata.annotations["crossplane.io/external-name"] // empty')
   existing_name=$(echo "$cr" | jq -r '.spec.forProvider.name // empty')
+
+  if is_unpaused "$cr" "$ADVCLUSTERS_CRD"; then
+    warn "  $ns/$name (or its owning composite) was not confirmed paused in the pre-phase - skipping rather than racing a live reconcile. Pause it manually and re-run 'post' for this CR."
+    echo "$ADVCLUSTERS_CRD/$name ($ns) - skipped, pause not confirmed in pre-phase" >> "$BACKUP_DIR/backfill-verification-failed.txt"
+    continue
+  fi
 
   if [ "$ns" = "cluster-scoped" ]; then
     backup_file="$BACKUP_DIR/advcluster-$name.yaml"
