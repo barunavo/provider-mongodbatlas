@@ -1,0 +1,21 @@
+scripts/migrate-to-v1.sh
+  s_4b63e47ba7bc23::t_332a4b27c5efda 200-230
+  s_4b63e47ba7bc23::t_7e27399e19e31f 440-445
+  s_4b63e47ba7bc23::t_196d3396712e2a 595-600
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "30761eedad6118dacfc6a3c33b66fc2c6bec3255",
+  "prompts": {},
+  "sessions": {
+    "s_4b63e47ba7bc23": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4948a962-4f6a-483c-bff7-0c30d62a9083",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "barunavo <barunavopal@outlook.com>"
+    }
+  }
+}
