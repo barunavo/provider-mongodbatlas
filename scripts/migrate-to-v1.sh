@@ -386,6 +386,7 @@ require_transitional_crd "$USERS_CRD"
 require_transitional_crd "$ADVCLUSTERS_CRD"
 
 log "Post-phase Step 1: Patching DatabaseUser CRs..."
+rm -f "$BACKUP_DIR/backfill-verification-failed.txt"
 
 db_users=$(kubectl get "$USERS_CRD" -A -o json 2>/dev/null || echo '{"items":[]}')
 user_count=$(echo "$db_users" | jq '.items | length')
@@ -429,37 +430,193 @@ echo "$db_users" | jq -c '.items[]' | while read -r cr; do
     else
       kubectl patch "$USERS_CRD" "$name" -n "$ns" --type=merge -p "$patch"
     fi
+
+    # The patch above can report success and still not stick: if the leaf CR
+    # has a controlling composite (see pause_owner in the pre-phase), an
+    # in-flight or unpaused reconcile of that composite can re-apply its
+    # pre-v1 base template over this CR immediately afterward, silently
+    # wiping the field we just set. Re-read the object a few times rather
+    # than trusting the patch's own exit code, and fail loudly - not just
+    # warn - if it never sticks, so this isn't discovered only after v1.x
+    # is already installed and the CR fails CEL validation.
+    persisted=""
+    for attempt in $(seq 1 5); do
+      if [ "$ns" = "cluster-scoped" ]; then
+        persisted=$(kubectl get "$USERS_CRD" "$name" -o jsonpath='{.spec.forProvider.username}' 2>/dev/null || true)
+      else
+        persisted=$(kubectl get "$USERS_CRD" "$name" -n "$ns" -o jsonpath='{.spec.forProvider.username}' 2>/dev/null || true)
+      fi
+      [ "$persisted" = "$username" ] && break
+      sleep 2
+    done
+    if [ "$persisted" = "$username" ]; then
+      log "    Verified: username persisted as $username"
+    else
+      warn "    username on $ns/$name did not persist after patch (got \"$persisted\", wanted \"$username\") - its owning composite is likely still reconciling despite the pre-phase pause. Check $BACKUP_DIR/unpaused-owners.txt and the composite's crossplane.io/paused status before proceeding."
+      echo "$USERS_CRD/$name ($ns) - username backfill did not persist (got \"$persisted\", wanted \"$username\")" >> "$BACKUP_DIR/backfill-verification-failed.txt"
+    fi
   fi
 done
 
 # ---------------------------------------------------------------------------
-# Post-phase Step 2: Touch AdvancedCluster CRs to trigger re-storage
+# Post-phase Step 2: Migrate AdvancedCluster region-config specs to v1alpha3
 # ---------------------------------------------------------------------------
-log "Post-phase Step 2: Triggering re-storage of AdvancedCluster CRs..."
+# v1alpha3 is not just a schema addition: electableSpecs, autoScaling,
+# analyticsAutoScaling, readOnlySpecs and analyticsSpecs all change from a
+# single-item array (v1alpha2) to a plain object (v1alpha3), and the
+# top-level diskSizeGb field is removed in favor of a diskSizeGb property on
+# electableSpecs/readOnlySpecs/analyticsSpecs individually. A bare "touch"
+# to trigger re-storage relies on CRD version conversion to reshape this -
+# but this provider has no conversion webhook, so Kubernetes' default (None)
+# conversion is a pure passthrough: it re-validates the SAME array-shaped
+# JSON against the new object-shaped schema, and structural-schema pruning
+# silently drops the whole mismatched subtree rather than restructuring it.
+# So this step reads each CR's pre-migration shape from the pre-phase's own
+# backup, builds the reshaped v1alpha3 structure explicitly, and patches
+# that in - it does not depend on conversion doing any work at all.
+log "Post-phase Step 2: Migrating AdvancedCluster region-config specs..."
 
 adv_clusters=$(kubectl get "$ADVCLUSTERS_CRD" -A -o json 2>/dev/null || echo '{"items":[]}')
 ac_count=$(echo "$adv_clusters" | jq '.items | length')
 log "  Found $ac_count AdvancedCluster CR(s)"
 
+build_advancedcluster_patch() {
+  local backup_file="$1" out_file="$2" cluster_name="$3"
+  python3 - "$backup_file" "$out_file" "$cluster_name" <<'PYEOF'
+import sys, json, yaml
+
+backup_path, out_path, cluster_name = sys.argv[1:4]
+
+with open(backup_path) as f:
+    cr = yaml.safe_load(f)
+
+fp = cr.get("spec", {}).get("forProvider", {})
+disk_size_gb = fp.get("diskSizeGb")
+
+# These five fields are arrays-of-one-object in v1alpha2 and plain objects
+# in v1alpha3. Only electableSpecs/readOnlySpecs/analyticsSpecs gain a
+# diskSizeGb property - autoScaling/analyticsAutoScaling never had one.
+ARRAY_TO_OBJECT_FIELDS = [
+    "electableSpecs",
+    "autoScaling",
+    "analyticsAutoScaling",
+    "readOnlySpecs",
+    "analyticsSpecs",
+]
+GETS_DISK_SIZE = {"electableSpecs", "readOnlySpecs", "analyticsSpecs"}
+
+new_replication_specs = []
+for rs in fp.get("replicationSpecs", []) or []:
+    new_rcs = []
+    for rc in rs.get("regionConfigs", []) or []:
+        new_rc = {}
+        for k, v in rc.items():
+            if k not in ARRAY_TO_OBJECT_FIELDS:
+                new_rc[k] = v
+        for field in ARRAY_TO_OBJECT_FIELDS:
+            items = rc.get(field) or []
+            if not items:
+                continue
+            if len(items) != 1:
+                sys.exit(
+                    f"expected exactly one item in regionConfigs[].{field} "
+                    f"(v1alpha2 always emits one), found {len(items)} in {backup_path} - "
+                    "refusing to guess which one is authoritative; inspect and migrate this CR manually."
+                )
+            obj = dict(items[0])
+            if field in GETS_DISK_SIZE and disk_size_gb is not None:
+                obj["diskSizeGb"] = disk_size_gb
+            new_rc[field] = obj
+        new_rcs.append(new_rc)
+    new_rs = {k: v for k, v in rs.items() if k != "regionConfigs"}
+    new_rs["regionConfigs"] = new_rcs
+    new_replication_specs.append(new_rs)
+
+# JSON merge patch: null deletes a key. diskSizeGb has no home at the
+# top level in v1alpha3 - its value has already been distributed above.
+# spec.forProvider.name is new in v1alpha3 and is a required parameter
+# there (validated by a CEL rule, not present at all in v1alpha2) - the
+# caller derives it from this CR's own external-name, matching exactly how
+# the v1alpha2 mongodbatlas_advanced_cluster resource config already builds
+# and parses that annotation (SetIdentifierFunc/GetExternalNameFn in
+# config/mongodbatlas/config.go): "<name>:<cluster_id>".
+patch = {"spec": {"forProvider": {"replicationSpecs": new_replication_specs, "diskSizeGb": None}}}
+if cluster_name:
+    patch["spec"]["forProvider"]["name"] = cluster_name
+
+with open(out_path, "w") as f:
+    json.dump(patch, f)
+PYEOF
+}
+
 echo "$adv_clusters" | jq -c '.items[]' | while read -r cr; do
   name=$(echo "$cr" | jq -r '.metadata.name')
   ns=$(echo "$cr" | jq -r '.metadata.namespace // "cluster-scoped"')
+  ext_name=$(echo "$cr" | jq -r '.metadata.annotations["crossplane.io/external-name"] // empty')
+  existing_name=$(echo "$cr" | jq -r '.spec.forProvider.name // empty')
 
-  log "  Touching AdvancedCluster $ns/$name"
-
-  if [ "$DRY_RUN" = "true" ]; then
-    log "    [dry-run] would touch $name"
+  if [ "$ns" = "cluster-scoped" ]; then
+    backup_file="$BACKUP_DIR/advcluster-$name.yaml"
   else
-    # Add a benign annotation to force a write (re-stores at current storage version)
-    ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    patch='{"metadata":{"annotations":{"migration.crossplane.io/v1alpha3-restorage":"'"$ts"'"}}}'
-    if [ "$ns" = "cluster-scoped" ]; then
-      kubectl patch "$ADVCLUSTERS_CRD" "$name" --type=merge -p "$patch"
+    backup_file="$BACKUP_DIR/advcluster-$ns-$name.yaml"
+  fi
+  [ -f "$backup_file" ] || die "no pre-phase backup found at $backup_file for AdvancedCluster $ns/$name - re-run '$0 pre --v1-crds-dir <dir>' first, Step 2 depends on it to know the pre-migration shape."
+
+  log "  Migrating AdvancedCluster $ns/$name region-config specs (from $backup_file)"
+
+  cluster_name="$existing_name"
+  if [ -z "$cluster_name" ]; then
+    # external-name format is "<name>:<cluster_id>" (see config/mongodbatlas/config.go).
+    cluster_name="${ext_name%%:*}"
+    if [ -z "$cluster_name" ]; then
+      warn "    No external-name annotation on $name, cannot infer spec.forProvider.name - the CEL required-field check on it will fail once v1.x is installed. Set it manually."
     else
-      kubectl patch "$ADVCLUSTERS_CRD" "$name" -n "$ns" --type=merge -p "$patch"
+      log "    Setting spec.forProvider.name = $cluster_name (from external-name)"
     fi
   fi
+
+  patch_file="$BACKUP_DIR/advcluster-patch-$ns-$name.json"
+  build_advancedcluster_patch "$backup_file" "$patch_file" "$cluster_name"
+
+  if [ "$DRY_RUN" = "true" ]; then
+    log "    [dry-run] would apply reshaped patch: $(cat "$patch_file")"
+    continue
+  fi
+
+  if [ "$ns" = "cluster-scoped" ]; then
+    kubectl patch "$ADVCLUSTERS_CRD" "$name" --type=merge -p "$(cat "$patch_file")"
+  else
+    kubectl patch "$ADVCLUSTERS_CRD" "$name" -n "$ns" --type=merge -p "$(cat "$patch_file")"
+  fi
+
+  # Verify the patch actually stuck - both the reshaped electableSpecs and
+  # the backfilled name - for the same reason Step 1 verifies the username
+  # patch: an owning composite re-applying its pre-v1 base template can
+  # silently overwrite either.
+  if [ "$ns" = "cluster-scoped" ]; then
+    got_instance_size=$(kubectl get "$ADVCLUSTERS_CRD" "$name" -o jsonpath='{.spec.forProvider.replicationSpecs[0].regionConfigs[0].electableSpecs.instanceSize}' 2>/dev/null || true)
+    got_name=$(kubectl get "$ADVCLUSTERS_CRD" "$name" -o jsonpath='{.spec.forProvider.name}' 2>/dev/null || true)
+  else
+    got_instance_size=$(kubectl get "$ADVCLUSTERS_CRD" "$name" -n "$ns" -o jsonpath='{.spec.forProvider.replicationSpecs[0].regionConfigs[0].electableSpecs.instanceSize}' 2>/dev/null || true)
+    got_name=$(kubectl get "$ADVCLUSTERS_CRD" "$name" -n "$ns" -o jsonpath='{.spec.forProvider.name}' 2>/dev/null || true)
+  fi
+  if [ -z "$got_instance_size" ]; then
+    warn "    electableSpecs on $ns/$name is empty after patching - its owning composite is likely still reconciling despite the pre-phase pause. Check $BACKUP_DIR/unpaused-owners.txt and the composite's crossplane.io/paused status before proceeding."
+    echo "$ADVCLUSTERS_CRD/$name ($ns) - electableSpecs empty after migration patch" >> "$BACKUP_DIR/backfill-verification-failed.txt"
+  else
+    log "    Verified: electableSpecs.instanceSize = $got_instance_size"
+  fi
+  if [ -n "$cluster_name" ] && [ "$got_name" != "$cluster_name" ]; then
+    warn "    name on $ns/$name did not persist after patch (got \"$got_name\", wanted \"$cluster_name\") - its owning composite is likely still reconciling despite the pre-phase pause."
+    echo "$ADVCLUSTERS_CRD/$name ($ns) - name backfill did not persist (got \"$got_name\", wanted \"$cluster_name\")" >> "$BACKUP_DIR/backfill-verification-failed.txt"
+  elif [ -n "$cluster_name" ]; then
+    log "    Verified: name persisted as $got_name"
+  fi
 done
+
+if [ -s "$BACKUP_DIR/backfill-verification-failed.txt" ]; then
+  die "one or more AdvancedCluster region-config migrations did not persist - see $BACKUP_DIR/backfill-verification-failed.txt. Do not install/activate the v1.x provider package until these are resolved."
+fi
 
 # ---------------------------------------------------------------------------
 # Post-phase Step 3: Remove v1alpha2 from storedVersions on affected CRDs,
