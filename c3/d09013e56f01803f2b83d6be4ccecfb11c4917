@@ -1,0 +1,27 @@
+scripts/migrate-to-v1.sh
+  s_4b63e47ba7bc23::t_ad07a685b16e35 555-556,567-572,574,577,579
+  s_4b63e47ba7bc23::t_e9b5314a87e997 592-595,598,601,608-614
+  s_4b63e47ba7bc23::t_5a406f796f41b8 389
+  s_4b63e47ba7bc23::t_c058f8363fdc6a 433-457,462,464-477,483,486-487,490-536,543,546-551,558-559,561-565,578,580-591,596-597,599-600,602-607,617-619
+  s_4b63e47ba7bc23::t_77f4d9677707cf 484-485,488
+  s_4b63e47ba7bc23::t_b72e552cda8ba1 537-542,544-545
+  s_4b63e47ba7bc23::t_706f8a31e8b4a0 489
+  s_4b63e47ba7bc23::t_4f6517f1581d07 566
+  s_4b63e47ba7bc23::t_0614278dfe872d 620
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "c3d09013e56f01803f2b83d6be4ccecfb11c4917",
+  "prompts": {},
+  "sessions": {
+    "s_4b63e47ba7bc23": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4948a962-4f6a-483c-bff7-0c30d62a9083",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Barunavo Pal <barunavo.pal@allianz.de>"
+    }
+  }
+}
