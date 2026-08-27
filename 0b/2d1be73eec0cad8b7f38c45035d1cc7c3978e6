@@ -1,0 +1,31 @@
+scripts/migrate-to-v1.sh
+  s_976c782288f082::t_108a660788572f 499-506
+  s_976c782288f082::t_891477c876e6a4 557
+  s_976c782288f082::t_cc8161adc83876 579
+  s_976c782288f082::t_f0df93fda3eb57 630
+  s_976c782288f082::t_715d54b093e5e7 797-809
+  s_976c782288f082::t_fdd008af5d8049 50-54
+  s_976c782288f082::t_8a3071196c90db 103-104
+  s_976c782288f082::t_a80a8663a39ace 734
+  s_976c782288f082::t_c2c76bf205aa00 785,791
+  s_976c782288f082::t_8814b4708d1827 10-12
+  s_976c782288f082::t_8b5c3b188659f2 239-247,254,256,267,269
+  s_976c782288f082::t_6ba35d195fe346 350-407
+  s_976c782288f082::t_84d40929e5e39a 476-498,507-537
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "0b2d1be73eec0cad8b7f38c45035d1cc7c3978e6",
+  "prompts": {},
+  "sessions": {
+    "s_976c782288f082": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "45ea088d-c6d7-40e9-bd3e-4e8ea2eb355a",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Barunavo Pal <barunavo.pal@allianz.de>"
+    }
+  }
+}
